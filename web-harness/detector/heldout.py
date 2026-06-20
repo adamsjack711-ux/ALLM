@@ -117,6 +117,30 @@ def _heldout_benign_family(
     }
 
 
+def _heldout_stealth_for_family(
+    sessions, family: str, tau: float
+) -> dict | None:
+    """Train on everything except this family's stealth=true sessions;
+    eval on those held-out stealth=true sessions. Tests whether the
+    detector's recall on the stealth variant of a family depends on
+    having seen that exact stealth variant during training.
+    """
+    train_excl = [s for s in sessions
+                  if not (s.family == family and s.stealth)]
+    test_excl = [s for s in sessions if s.family == family and s.stealth]
+    if not train_excl or not test_excl:
+        return {"skipped": "empty split"}
+    ys = [s.y for s in train_excl]
+    if sum(ys) == 0 or sum(1 for y in ys if y == 0) == 0:
+        return {"skipped": "single-class train"}
+    _, scores_excl = train_and_score(train_excl, test_excl)
+    return {
+        "n_train_sessions": len(train_excl),
+        "n_holdout_sessions": len(test_excl),
+        "heldout_recall": float((scores_excl >= tau).mean()),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=pathlib.Path, default=pathlib.Path("/data"))
@@ -164,6 +188,16 @@ def main() -> int:
         mask = np.array([s.family == b for s in test_in])
         in_dist_fp[b] = _alert_rate(scores_in, mask, tau)
 
+    # phase 10: in-distribution recall on each agent family's
+    # stealth=false sessions in the random-split test set. The
+    # held-out-stealth eval below compares the model's recall on the
+    # held-out stealth=true variant against this same-family stealth=
+    # false baseline.
+    in_dist_recall_nonstealth: dict[str, float] = {}
+    for a in agent_families:
+        mask = np.array([s.family == a and not s.stealth for s in test_in])
+        in_dist_recall_nonstealth[a] = _alert_rate(scores_in, mask, tau)
+
     # --- 2. Held-out agent families. ---
     per_attacker: dict[str, dict] = {}
     for excluded in agent_families:
@@ -210,6 +244,46 @@ def main() -> int:
             "n_holdout_sessions": info["n_holdout_sessions"],
         }
 
+    # --- 4. Held-out stealth (phase 10). ---
+    # For each agent family that has BOTH stealth=true and stealth=false
+    # sessions, train without the stealth=true ones (model has never
+    # seen this family's stealth variant) and eval on them. Compare
+    # recall to the same-family stealth=false in-distribution baseline.
+    # Flag stealth_evades_detector if held-out recall < 0.5 ×
+    # in-distribution stealth-false recall — symmetric to the agent
+    # overfit gate.
+    per_family_stealth_holdout: dict[str, dict] = {}
+    for fam in agent_families:
+        has_stealth = any(s.family == fam and s.stealth for s in sessions)
+        has_nonstealth = any(s.family == fam and not s.stealth for s in sessions)
+        if not (has_stealth and has_nonstealth):
+            per_family_stealth_holdout[fam] = {
+                "skipped": "family missing one of stealth=true/false in data"
+            }
+            continue
+        info = _heldout_stealth_for_family(sessions, fam, tau)
+        if info is None or "skipped" in info:
+            per_family_stealth_holdout[fam] = info or {"skipped": "no result"}
+            continue
+        in_dist_ns = in_dist_recall_nonstealth.get(fam)
+        recall = info["heldout_recall"]
+        ratio = (
+            recall / in_dist_ns if in_dist_ns and in_dist_ns > 1e-9
+            else float("nan")
+        )
+        per_family_stealth_holdout[fam] = {
+            "in_dist_nonstealth_recall": in_dist_ns,
+            "heldout_stealth_recall": recall,
+            "heldout_ratio": ratio,
+            "stealth_evades_detector": (
+                bool(in_dist_ns and recall < 0.5 * in_dist_ns)
+                if in_dist_ns is not None and not np.isnan(in_dist_ns)
+                else None
+            ),
+            "n_train_sessions": info["n_train_sessions"],
+            "n_holdout_sessions": info["n_holdout_sessions"],
+        }
+
     report = {
         "threshold_in_dist": tau,
         "fp_per_hour_budget": args.fp_per_hour_budget,
@@ -218,6 +292,7 @@ def main() -> int:
         "benign_families": benign_families,
         "per_attacker": per_attacker,
         "per_benign_family": per_benign,
+        "per_family_stealth_holdout": per_family_stealth_holdout,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))
@@ -244,6 +319,21 @@ def main() -> int:
         print(
             f"  benign {b:>13}  in_dist_fp={in_d_s}  "
             f"heldout_fp={info['heldout_fp_rate']:.2f}  [{flag}]",
+            flush=True,
+        )
+    for fam, info in per_family_stealth_holdout.items():
+        if "skipped" in info:
+            print(f"  stealth {fam:>12}  SKIPPED: {info['skipped']}", flush=True)
+            continue
+        flag = "STEALTH-EVADES" if info["stealth_evades_detector"] else "ok"
+        in_d = info["in_dist_nonstealth_recall"]
+        in_d_s = f"{in_d:.2f}" if in_d is not None and not np.isnan(in_d) else "nan"
+        ratio = info["heldout_ratio"]
+        ratio_s = f"{ratio:.2f}" if not np.isnan(ratio) else "nan"
+        print(
+            f"  stealth {fam:>12}  in_dist_nonstealth={in_d_s}  "
+            f"heldout_stealth={info['heldout_stealth_recall']:.2f}  "
+            f"ratio={ratio_s}  [{flag}]",
             flush=True,
         )
     return 0

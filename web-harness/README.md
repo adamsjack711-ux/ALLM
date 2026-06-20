@@ -26,6 +26,7 @@ pointed at DVWA at security levels low → high.
 | 7 | Multi-target (Juice Shop / WebGoat / VAmPI) + sqlmap / Selenium / Puppeteer agents | ✅ |
 | 8 | Detector eval rollup: per-family / per-target_app / agent-vs-benign_bot + held-out family | ✅ |
 | 9 | Stealth twins of every agent + per-stealth / per-(family, stealth) eval cells | ✅ |
+| 10 | Held-out-stealth eval + orchestrator sweep `{target}×{family}×{security_level}×{stealth}` | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -87,6 +88,11 @@ python3 tests/phase8_smoke.py                              # synth-fed, no docke
 python3 tests/phase9_smoke.py                              # synth-fed, no docker, ~7s
 # or run the stealth profile by hand:
 docker compose --profile stealth up -d --build             # 4 stealth twins (family unchanged)
+
+# Phase 10: held-out-stealth eval + orchestrator sweep
+python3 tests/phase10_smoke.py                             # synth-fed, no docker, ~20s
+# or the canonical end-to-end sweep:
+python3 orchestrator/sweep.py --sessions 2                 # ~34 cells, brings up benign continuously
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -554,13 +560,103 @@ blocks are populated on both heads with no "accuracy" leak.
 
 ### What phase 9 explicitly does not do
 
-- Real OpenAI / Gemini PentesterPro (still mocked). Phase 10.
-- nikto / ffuf / Scrapy / raw httpx generators. Phase 10.
-- crAPI as a fourth target. Phase 10.
-- Held-out-stealth eval (train stealth=false only, eval stealth=true)
-  — symmetric in spirit to phase 8's held-out family but for the
-  stealth axis. The data the smoke produces would support it; the
-  eval rollup just doesn't wire it yet.
+- Real OpenAI / Gemini PentesterPro (still mocked). Phase 11+.
+- nikto / ffuf / Scrapy / raw httpx generators. Phase 11+.
+- crAPI as a fourth target. Phase 11+.
+- ~~Held-out-stealth eval (train stealth=false only, eval stealth=true)~~
+  **Phase 10 ships this** — see below.
+
+## Phase 10 — held-out-stealth eval + orchestrator sweep
+
+Phases 6–9 added the schema axes (`target_app`, `family`, `stealth`,
+`security_level`) and the stealth twins, and phase 8/9 added the
+per-axis eval cells. Phase 10 connects them end-to-end:
+
+### Held-out-stealth eval (`detector/heldout.py`)
+
+For each agent family that has BOTH stealth=true AND stealth=false
+sessions, train the detector WITHOUT that family's stealth=true
+sessions and eval recall on them. Compare to in-distribution recall
+on the same family's stealth=false sessions.
+
+Symmetric to phase 5/8's `overfits_attacker` gate, applied to the
+stealth axis:
+
+```
+stealth_evades_detector := held-out stealth=true recall
+                          < 0.5 × in-distribution stealth=false recall
+```
+
+Heldout JSON gains a `per_family_stealth_holdout` block per family:
+
+```json
+{
+  "playwright_bot": {
+    "in_dist_nonstealth_recall": 0.85,
+    "heldout_stealth_recall": 0.30,
+    "heldout_ratio": 0.35,
+    "stealth_evades_detector": true,
+    "n_train_sessions": 33,
+    "n_holdout_sessions": 6
+  },
+  ...
+}
+```
+
+Families missing one of the two stealth values get `{"skipped":
+"family missing one of stealth=true/false in data"}` so the gate
+fails cleanly rather than silently dropping.
+
+### Orchestrator sweep (`orchestrator/sweep.py`)
+
+Per the spec — **"sweep `{target} × {family} × {security_level} ×
+{stealth}`, with benign traffic running continuously and
+interleaved"** — `sweep.py` builds a plan of cells across those four
+axes, drives `docker compose run --rm` per cell, then assembles a
+single sweep report on top of the merged data:
+
+| component | what |
+|---|---|
+| `default_config()` | returns a `SweepConfig` with sensible axis values: DVWA + Juice Shop + VAmPI; the 4 agent families; `low` + `medium` security; both stealth values. Trims combinations that don't make sense (Selenium/Puppeteer at VAmPI — no DOM; sqlmap-stealth × high security — yields nothing). Default ≈ 34 cells. |
+| `build_sweep_plan(config)` | pure-Python; returns `list[SweepCell]`. Testable without docker. |
+| `start_benign(config)` | brings up the 5 benign_bot services once; they run continuously underneath the sweep so the FP/hour denominator stays meaningful. |
+| `execute_sweep(plan)` | drives `docker compose run --rm` per cell with `ALLM_TARGET / ALLM_TARGET_APP / DVWA_SECURITY_LEVEL / ALLM_SESSIONS / ALLM_STEALTH` env. Cells continue after a failure — the eval already tolerates partial data. |
+| `per_cell_census(plan, sessions_path)` | joins each planned cell to the actual `sessions.jsonl` provenance rows so the report shows which cells actually produced data. |
+| `build_sweep_report(data_dir, plan)` | runs `train.py + eval.py + heldout.py` as subprocesses, attaches the census, and returns one report dict that the CLI writes to `data/reports/sweep_<ts>.json`. |
+
+```sh
+# the canonical end-to-end sweep on the operator's machine
+python3 orchestrator/sweep.py --sessions 2 --benign-sessions 3
+
+# retry the report after an aborted sweep without re-running cells
+python3 orchestrator/sweep.py --skip-docker
+```
+
+### Smoke
+
+```sh
+python3 tests/phase10_smoke.py   # synth-fed, no docker, ~20s
+```
+
+Asserts: `default_config()` covers ≥3 targets / ≥4 families / both
+stealth values and VAmPI is sqlmap-only; `per_family_stealth_holdout`
+has at least one family that actually ran (not just `skipped`);
+`per_cell_census` correctly joins planned cells to provenance rows
+(matches the 4 cells our synth produced, leaves the nonexistent
+fifth cell as `any_provenance_seen=False`); `build_sweep_report`
+emits `summary / per_cell_census / eval / heldout` blocks; "accuracy"
+never appears.
+
+### What phase 10 explicitly does not do
+
+- The 4 remaining scanner generators (nikto, ffuf, raw httpx, Scrapy)
+  and real OpenAI / Gemini PentesterPro. The sweep config skips
+  unknown families; adding them is a one-liner in `_FAMILY_SERVICES`.
+- crAPI as a fourth target. Same story — add a new `_TARGETS` entry
+  and the sweep picks it up.
+- Held-out-(target_app) eval. Conceptually symmetric to held-out-
+  family / held-out-stealth; not asked for in the original spec, so
+  not built.
 
 ## Out of scope
 

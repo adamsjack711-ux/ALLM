@@ -68,7 +68,7 @@ def sweep_v3(seed, epochs):
     return {
         "pr_auc":     _grab(r"PR-AUC:\s+([0-9.]+)", t),
         "fp_per_hour": _grab(r"achieved FP/hour \(test\):\s*([0-9.]+)", t),
-        "detect_pct": _grab(r"detected:\s+\d+/\d+\s+\(([0-9.]+)%", t),
+        "detect_pct": _grab(r"detected:\s+\d+\s+\(([0-9.]+)%", t),
         "mttd_s":     _grab(r"mean-time-to-detect:\s+([0-9.]+)\s*s", t),
     }
 

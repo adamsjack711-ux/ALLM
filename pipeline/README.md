@@ -298,18 +298,184 @@ hand-written `workload.json` containing `class`, `framework`,
 
 ### What phase 2 explicitly does *not* do
 
-- **Re-documented alert-fatigue arithmetic on real data.** The
-  formula sits in the web harness README; the meaningful denominator
-  on the host side comes from multi-day real-range telemetry, not
-  five synth campaigns.
+- ~~Re-documented alert-fatigue arithmetic on real data.~~
+  **Phase 3 ships this** — see the section below.
 - **WEC / winlogbeat collector tuning docs.** Lab-side; the real-data
   section sketches the shape but doesn't go deep.
 - **Multi-day campaign aggregation.** One campaign = one CALDERA op
   or one shift of activity for now. Spanning days requires either
   longer windows or a different group key.
 
+## Phase 3 — alert-fatigue arithmetic (host-side, window-rate-based)
+
+The web harness side computes FP/hour at the **session** level:
+
+```
+E[FP/hour] = p_session × (60 / μ_minutes)
+```
+
+The host pipeline doesn't have sessions. It has **32-event windows**
+produced continuously as Sysmon events stream in. So the host-side
+arithmetic is window-rate-based, derived from real per-window FP
+rates measured at the threshold τ.
+
+### The formula
+
+```
+Per-window FP rate at τ (measured from eval set, per benign class):
+  p_w(class, subtype) = P(score >= τ | label = 0, class, subtype)
+
+Continuous-workload window-production rate for a deployment of N
+hosts each emitting R events/sec across Sysmon EID 1, 3, 11, 13, …:
+  W_total = N × R × 3600 / WINDOW_STRIDE   windows/hour
+
+Expected FPs/hour from normal background workload:
+  E[FP/hour | normal] = p_w(normal) × W_total
+
+Sanctioned hard-negative bursts (PS remoting, scheduled tasks,
+WMI, sanctioned scans, backup jobs) generate brief windows of
+elevated event rate. For each subtype b with duration D_b
+seconds, burst event rate R_b, fired F_b bursts/host/day:
+  windows_per_burst = D_b × R_b / WINDOW_STRIDE
+  bursts_per_hour   = F_b × N / 24
+  E[FP/hour | b]    = p_w(b) × windows_per_burst × bursts_per_hour
+
+Total expected FPs/hour at τ:
+  E[FP/hour] = E[FP/hour | normal] + Σ_b E[FP/hour | b]
+```
+
+### MTTD
+
+Mean time-to-detect per attack family (CALDERA, Atomic): for each
+attack campaign, the wall-clock from the campaign's first window to
+the first window whose score >= τ. Reported separately per family so
+the held-out family's MTTD can be compared to in-distribution. A
+flat-line MTTD on the held-out family is the same signal
+`heldout_emulation`'s low recall surfaces — alert-fatigue tooling
+makes it operationally legible.
+
+### Tooling
+
+`pipeline/alert_fatigue.py` runs the whole computation end-to-end
+against whatever campaigns are in `data/host/manifest.jsonl`:
+
+```sh
+# all campaigns in data/host/, default 3-deployment matrix
+python3 -m pipeline.alert_fatigue --fp-budget 1.0
+
+# override deployment shape
+python3 -m pipeline.alert_fatigue --hosts 200 --event-rate 2.0
+
+# tighter alert budget
+python3 -m pipeline.alert_fatigue --fp-budget 0.25
+```
+
+The script:
+1. Loads every campaign's metadata + Sysmon JSONL.
+2. Normalizes + windowizes.
+3. Stratified-splits campaigns by (class, framework, benign_subtype)
+   so eval has at least one of each bucket.
+4. Trains `HistGradientBoostingClassifier` on the train split.
+5. Picks τ at the FP-budget against the eval window-rate.
+6. Computes `p_w(normal)` + `p_w(b)` for each hard-negative subtype
+   present in eval.
+7. Computes MTTD per attack framework.
+8. Applies the deployment-shape arithmetic for `small_office (10h,
+   1.0 evt/s)`, `med_business (50h, 1.5/s)`, `large_business (200h,
+   2.0/s)` by default — overridable via `--hosts` / `--event-rate`.
+9. Writes `data/host/alert_fatigue.json` + prints a readable summary.
+
+### Default hard-negative burst shapes (override in code if needed)
+
+| benign_subtype | bursts/host/day | duration (s) | burst event rate (/s) |
+|---|---|---|---|
+| `ps_remoting` | 4 | 300 | 6.0 |
+| `wmi` | 12 | 60 | 5.0 |
+| `sched_task` | 6 | 30 | 3.0 |
+| `sanctioned_scan` | 1 | 600 | 8.0 |
+| `backup` | 2 | 900 | 4.0 |
+
+These are starting points calibrated against the phase-host-2 synth
+generators. **Replace them with measurements from your range** before
+trusting the deployment estimates.
+
+### Worked example (synth data, structural)
+
+After running the phase-host-2 synth pipeline through
+`score_campaign.py` on 6 campaigns (1 CALDERA + 1 Atomic + 1 normal +
+3 hard-negative subtypes):
+
+```
+[alert_fatigue] threshold τ                = 0.974  (budget 1.00 FP/hour)
+[alert_fatigue] benign window duration est = 174.3s
+[alert_fatigue] per-window FP on normal    = 0.0000  (0/17 windows)
+[alert_fatigue] MTTD per attack family:
+        atomic  detected 0/1  MTTD=n/a
+       caldera  detected 1/1  MTTD=174.3s
+[alert_fatigue] deployment FP/hour estimates:
+   small_office  hosts=10   R=1.0/s  total=0.00/h
+   med_business  hosts=50   R=1.5/s  total=0.00/h
+   large_business hosts=200 R=2.0/s  total=0.00/h
+```
+
+Numbers are zero because the synth dataset's per-window FP rate is
+zero — the model trivially separates the small synth distributions.
+**The synth output validates that the tooling runs; it tells you
+nothing about real production behavior.**
+
+Note the interesting structural signal: CALDERA campaign detected,
+Atomic campaign missed. That's the held-out-emulation gap from phase
+2 showing up through the alert-fatigue lens. On real range data the
+same number tells you "your detector is blind to one attack family"
+in operational terms.
+
+### Swap in real-range data
+
+Real numbers require real campaigns under `data/host/`. The minimum
+viable real-data run:
+
+1. **One CALDERA campaign** through your authorized lab (phase-host-1
+   real-data section). Stage it.
+2. **One Atomic Red Team campaign** (phase-host-2 real-data section)
+   covering the same 6 tactics. Stage it.
+3. **At least one 24-hour normal-workload capture** — point Sysmon
+   at an ordinary workstation for a day, dump that as `sysmon.jsonl`,
+   write a hand-built `workload.json` with `class=normal,
+   framework=scripted, ts_start, ts_end, host_list`. Score it.
+4. **One or more hard-negative captures** — schedule a sanctioned
+   PowerShell remoting session, a WMI sweep, a backup job, etc.
+   Dump each as a separate campaign with `class=hard_negative,
+   benign_subtype=<one_of_the_5>`. Score them.
+5. Calibrate the per-subtype `bursts_per_host_per_day` shapes against
+   your environment (read your incident-response runbooks or count
+   from `4698` / `5140` / `wsmprovhost.exe` events over a sample
+   period).
+6. Run `python3 -m pipeline.alert_fatigue --fp-budget <your_budget>
+   --hosts <fleet_size> --event-rate <observed_evt_per_sec>`.
+
+The output gives you, **at the budget you can actually staff**:
+
+- The threshold τ to deploy.
+- The MTTD you can expect per attack family.
+- A breakdown of where alerts come from — continuous workload noise
+  vs each sanctioned-admin burst class.
+- A flag (via the `detected_rate < 1.0` row) when an emulation family
+  is silently missing from your detector's blind spot.
+
+### What phase 3 explicitly does *not* do
+
+- **Multi-day campaign aggregation.** Each campaign is still one op
+  or one shift. Spanning days for the same campaign needs either
+  longer windows or a different group key.
+- **WEC / winlogbeat collector tuning docs.** Configuration is
+  environment-specific; the tooling produces correct arithmetic
+  regardless of which collector feeds the JSONL.
+- **Auto-discovery of `bursts_per_host_per_day`.** The defaults are
+  hand-calibrated against synth; production deployments should
+  measure their own via the runbook count described above.
+
 ## What phase 1 explicitly does *not* do (historical)
 
 Phase 1 originally deferred Atomic, normal-workload, hard-negative,
 held-out family sweep, and per-subtype FP reporting to phase 2. All
-five are now shipped — see the section above.
+five shipped in phase 2.

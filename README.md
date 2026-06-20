@@ -1,4 +1,4 @@
-# ALLM — AI-Attack Detector
+# Aardvark— AI-Attack Detector
 
 A defender-side detector that flags AI-agent-driven activity in security
 telemetry and classifies it against MITRE ATT&CK.

@@ -6,6 +6,10 @@ data/reports/*
 !data/reports/.gitkeep
 data/models/
 
+# phase-bench-2: hidden test splits stay local. Public splits in the
+# same dirs ARE committed.
+benchmark/splits/*/private_*.json
+
 __pycache__/
 *.pyc
 *.pyo

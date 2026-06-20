@@ -41,6 +41,16 @@ SESSIONS = int(os.environ.get("ALLM_SESSIONS", "2"))
 DVWA_USER = os.environ.get("DVWA_USER", "admin")
 DVWA_PASS = os.environ.get("DVWA_PASS", "password")
 SQLMAP_TIMEOUT_S = int(os.environ.get("SQLMAP_TIMEOUT_S", "300"))
+STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+# Stealth knobs: real-browser UA, --delay 3 between requests (sub-machine-
+# fast cadence), --level=1 --risk=1 (less aggressive payload set), single
+# session per generator run.
+STEALTH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 _TOKEN_RE = re.compile(r'name=["\']user_token["\']\s+value=["\']([^"\']+)["\']')
@@ -78,18 +88,32 @@ def _target_url(target_app: str) -> str:
 
 
 def _sqlmap_cmd(target_url: str, cookie_hdr: str, label_headers: dict) -> list[str]:
-    cmd = [
-        "sqlmap",
-        "-u", target_url,
-        "--batch",
-        "--level=2",
-        "--risk=2",
-        "--smart",
-        "--threads=4",
-        "--timeout=10",
-        "--retries=1",
-        "--user-agent", "sqlmap/1.7",
-    ]
+    if STEALTH:
+        cmd = [
+            "sqlmap",
+            "-u", target_url,
+            "--batch",
+            "--level=1",
+            "--risk=1",
+            "--threads=1",
+            "--delay=3",
+            "--timeout=15",
+            "--retries=1",
+            "--user-agent", STEALTH_UA,
+        ]
+    else:
+        cmd = [
+            "sqlmap",
+            "-u", target_url,
+            "--batch",
+            "--level=2",
+            "--risk=2",
+            "--smart",
+            "--threads=4",
+            "--timeout=10",
+            "--retries=1",
+            "--user-agent", "sqlmap/1.7",
+        ]
     if cookie_hdr:
         cmd.extend(["--cookie", cookie_hdr])
     for h, v in label_headers.items():
@@ -98,17 +122,23 @@ def _sqlmap_cmd(target_url: str, cookie_hdr: str, label_headers: dict) -> list[s
 
 
 def run_session(i: int) -> int:
+    config = (
+        {"target_app": TARGET_APP, "level": 1, "risk": 1, "delay_s": 3,
+         "threads": 1, "stealth": True}
+        if STEALTH else
+        {"target_app": TARGET_APP, "level": 2, "risk": 2, "smart": True,
+         "threads": 4, "stealth": False}
+    )
     payload = build_payload(
         klass="agent", family=LABEL, target_app=TARGET_APP,
-        security_level=SECURITY_LEVEL, stealth=False,
-        generator="sqlmap", generator_version="0.1.0",
-        generator_config={
-            "target_app": TARGET_APP, "level": 2, "risk": 2,
-            "smart": True, "threads": 4,
-        },
+        security_level=SECURITY_LEVEL, stealth=STEALTH,
+        generator="sqlmap", generator_version="0.2.0",
+        generator_config=config,
     )
     label_headers = headers_for(payload)
-    request_headers = label_headers | {"User-Agent": "sqlmap/1.7"}
+    request_headers = label_headers | {
+        "User-Agent": STEALTH_UA if STEALTH else "sqlmap/1.7"
+    }
 
     with httpx.Client(
         base_url=TARGET, headers=request_headers,
@@ -145,8 +175,9 @@ def run_session(i: int) -> int:
 
 
 def main() -> int:
+    mode = "stealth" if STEALTH else "fast"
     print(f"[{LABEL}] target={TARGET} target_app={TARGET_APP} "
-          f"sessions={SESSIONS}", flush=True)
+          f"mode={mode} sessions={SESSIONS}", flush=True)
     for i in range(SESSIONS):
         run_session(i)
     print(f"[{LABEL}] done", flush=True)

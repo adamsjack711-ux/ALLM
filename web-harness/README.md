@@ -25,6 +25,7 @@ pointed at DVWA at security levels low → high.
 | 6 | benign_bot family + per-session provenance manifest + label-schema columns | ✅ |
 | 7 | Multi-target (Juice Shop / WebGoat / VAmPI) + sqlmap / Selenium / Puppeteer agents | ✅ |
 | 8 | Detector eval rollup: per-family / per-target_app / agent-vs-benign_bot + held-out family | ✅ |
+| 9 | Stealth twins of every agent + per-stealth / per-(family, stealth) eval cells | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -81,6 +82,11 @@ docker compose --profile attack-extended up -d --build     # sqlmap / selenium /
 
 # Phase 8: detector eval rollup (per-family / per-target_app / agent-vs-benign_bot)
 python3 tests/phase8_smoke.py                              # synth-fed, no docker, ~10s
+
+# Phase 9: stealth twins + per-stealth eval cells
+python3 tests/phase9_smoke.py                              # synth-fed, no docker, ~7s
+# or run the stealth profile by hand:
+docker compose --profile stealth up -d --build             # 4 stealth twins (family unchanged)
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -486,8 +492,75 @@ eval blocks degrade to whatever signal those labels carry.
   phase 5 already asserts on the legacy `per_source` block; that
   still works. The new blocks are produced, just not gate-asserted
   there. `tests/phase8_smoke.py` asserts the new blocks directly.
-- Stealth variants of generators, real-LLM PentesterPro, more
-  scanners (nikto / ffuf / Scrapy). Phase 9.
+- ~~Stealth variants of generators~~ — **phase 9** ships these.
+- Real-LLM PentesterPro, more scanners (nikto / ffuf / Scrapy). Phase 10.
+
+## Phase 9 — stealth twins of every agent + per-stealth eval
+
+Phase 6 introduced the `stealth` manifest axis but no generator ever
+set it to `true`. Phase 9 exercises it: each existing agent gets a
+stealth-mode code path gated by `ALLM_STEALTH=true`. Family stays the
+same (per the spec); the `stealth` flag is the distinguishing axis.
+
+### Stealth knobs per agent
+
+| family | stealth=false (default) | stealth=true |
+|---|---|---|
+| `playwright_bot` | spray-fuzzer: greedy fill-all (incl. invisible_field), robots.txt-driven recon, no delays | one visible input per page, human-typed payload, mouse jitter, 2.5–6.5s pauses, no robots recon, real-browser UA |
+| `sqlmap` | `--level=2 --risk=2 --smart --threads=4`, UA `sqlmap/1.7`, no delay | `--level=1 --risk=1 --threads=1 --delay=3`, real-browser UA |
+| `selenium_bot` | spray fill, no pauses | one visible input only, slow per-char typing, post-submit pause, real-browser UA |
+| `puppeteer_bot` | spray fill via puppeteer's `type()` | drop off-screen inputs (skip invisible_field honeypot), one visible input, post-submit pause, real-browser UA |
+
+Stealth mode for browser bots also **skips the recon pass** — no
+`/robots.txt` read, no Disallow-path follow — which means stealth
+sessions don't trip `robots_read` or `admin_secrets` honeypots
+organically. Stealth sqlmap doesn't read robots either (it never did).
+
+### Compose
+
+Four new services under `profiles: ["stealth"]`, each reusing the
+matching non-stealth image with `ALLM_STEALTH=true`:
+
+```sh
+docker compose --profile stealth up -d --build       # 4 stealth twins
+```
+
+### Eval cells added
+
+Both `with_hp` and `ml_only` heads get two new blocks alongside
+phase 8's `per_family` / `per_target_app` / `agent_vs_benign_bot`:
+
+| key | shape | what it answers |
+|---|---|---|
+| `per_stealth` | `{"true": {test_sessions, alerts, alert_rate, n_agent_truth, n_benign_truth}, "false": {…}}` | Stealth-vs-not as a top-level cut. Agent-truth and benign-truth counts let consumers interpret alert_rate as TPR or FPR. |
+| `per_family_stealth` | `{"<family>::stealth=true": {family, stealth, kind, test_sessions, alerts, alert_rate, recall_if_agent, fp_rate_if_benign}, "<family>::stealth=false": {…}, …}` | The load-bearing block: does stealth degrade recall for this specific family? Compute `recall_if_agent_stealth_true / recall_if_agent_stealth_false` per family. |
+
+The phase 6+ Session dataclass picks up `stealth` from the
+`sessions.jsonl` provenance row, falling back to a majority vote
+across the session's request rows. Pre-phase-9 data parses as
+`stealth=false` (no provenance, no per-row stealth column → falsy
+majority).
+
+### Run
+
+```sh
+python3 tests/phase9_smoke.py                              # synth-fed, no docker, ~7s
+```
+
+Smoke asserts: `Session.stealth` resolves both truthy and falsy, at
+least one agent family has both stealth=true AND stealth=false
+sessions, and the eval JSON `per_stealth` + `per_family_stealth`
+blocks are populated on both heads with no "accuracy" leak.
+
+### What phase 9 explicitly does not do
+
+- Real OpenAI / Gemini PentesterPro (still mocked). Phase 10.
+- nikto / ffuf / Scrapy / raw httpx generators. Phase 10.
+- crAPI as a fourth target. Phase 10.
+- Held-out-stealth eval (train stealth=false only, eval stealth=true)
+  — symmetric in spirit to phase 8's held-out family but for the
+  stealth axis. The data the smoke produces would support it; the
+  eval rollup just doesn't wire it yet.
 
 ## Out of scope
 

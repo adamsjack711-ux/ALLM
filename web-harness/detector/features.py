@@ -79,6 +79,11 @@ class Session:
     klass: str = "unknown"
     family: str = ""
     target_app: str = "dvwa"
+    # phase 9: stealth axis. True when the generator ran in stealth
+    # mode (slow cadence, mouse jitter, honeypot-avoidant). Resolved
+    # like family / target_app: sessions.jsonl meta wins, else majority
+    # across the session's request rows, else False.
+    stealth: bool = False
 
 
 def _safe_log1p(x: float) -> float:
@@ -281,10 +286,13 @@ def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Sessio
         klass = ""
         family = ""
         target_app = ""
+        stealth_meta: bool | None = None
         if meta:
             klass = meta.get("class", "") or ""
             family = meta.get("family", "") or ""
             target_app = meta.get("target_app", "") or ""
+            if "stealth" in meta:
+                stealth_meta = bool(meta.get("stealth"))
         if not klass:
             klass = _majority_str(r.get("class") for r in rs)
         if not family:
@@ -297,6 +305,18 @@ def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Sessio
             family = label
         if not target_app:
             target_app = "dvwa"
+
+        # phase 9: stealth resolution. Prefer the provenance row, then
+        # majority of stealth flags across request rows, else False.
+        if stealth_meta is not None:
+            stealth = stealth_meta
+        else:
+            stealth_votes = [bool(r.get("stealth")) for r in rs
+                             if "stealth" in r]
+            if stealth_votes:
+                stealth = sum(stealth_votes) > (len(stealth_votes) / 2)
+            else:
+                stealth = False
 
         y = 1 if klass == "agent" else 0
         sessions.append(
@@ -313,6 +333,7 @@ def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Sessio
                 klass=klass,
                 family=family,
                 target_app=target_app,
+                stealth=stealth,
             )
         )
     sessions.sort(key=lambda s: s.ts_start)

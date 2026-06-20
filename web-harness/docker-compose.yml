@@ -315,6 +315,81 @@ services:
     networks: [allm_lab]
     profiles: ["attack-extended"]
 
+  # ── phase 9: stealth twins (family stays the same; stealth=true) ─────
+  # Each reuses the matching non-stealth image and toggles ALLM_STEALTH
+  # so the bot picks the slow / honeypot-avoidant code paths. Family in
+  # the manifest stays unchanged (playwright_bot / sqlmap / selenium_bot
+  # / puppeteer_bot) — only the `stealth` axis differs. Eval slices on
+  # (family, stealth) to surface whether stealth degrades recall.
+
+  playwright_bot_stealth:
+    build:
+      context: ./generators
+      dockerfile: playwright_bot/Dockerfile
+    container_name: allm_playwright_bot_stealth
+    environment:
+      ALLM_TARGET: ${PLAYWRIGHT_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${PLAYWRIGHT_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BOT:-5}
+      ALLM_STEALTH: "true"
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["stealth"]
+
+  sqlmap_stealth:
+    build:
+      context: ./generators
+      dockerfile: sqlmap_bot/Dockerfile
+    container_name: allm_sqlmap_stealth
+    environment:
+      ALLM_TARGET: ${SQLMAP_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${SQLMAP_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_SQLMAP:-1}
+      ALLM_STEALTH: "true"
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["stealth"]
+
+  selenium_bot_stealth:
+    build:
+      context: ./generators
+      dockerfile: selenium_bot/Dockerfile
+    container_name: allm_selenium_bot_stealth
+    environment:
+      ALLM_TARGET: ${SELENIUM_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${SELENIUM_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_SELENIUM:-3}
+      ALLM_STEALTH: "true"
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["stealth"]
+
+  puppeteer_bot_stealth:
+    build:
+      context: ./generators
+      dockerfile: puppeteer_bot/Dockerfile
+    container_name: allm_puppeteer_bot_stealth
+    environment:
+      ALLM_TARGET: ${PUPPETEER_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${PUPPETEER_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_PUPPETEER:-3}
+      ALLM_STEALTH: "true"
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["stealth"]
+
 networks:
   allm_lab:
     name: allm_lab

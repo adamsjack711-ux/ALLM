@@ -229,6 +229,52 @@ def evaluate_head(
         "per_benign_family_fp": benign_per_fam,
     }
 
+    # phase 9: per_stealth slice — stealth-vs-not as a top-level cut.
+    # Each cell carries an alert_rate (TPR for agents, FPR for benigns,
+    # interpretation by `n_agent_truth` / `n_benign_truth` ratio).
+    per_stealth: dict[str, dict] = {}
+    for label_val, mask in (
+        ("true",  np.array([bool(s.stealth) for s in test_sess])),
+        ("false", np.array([not bool(s.stealth) for s in test_sess])),
+    ):
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        pos = int(((pred == 1) & mask).sum())
+        per_stealth[label_val] = {
+            "test_sessions": n,
+            "alerts": pos,
+            "alert_rate": pos / max(n, 1),
+            "n_agent_truth": int(y[mask].sum()),
+            "n_benign_truth": int((y[mask] == 0).sum()),
+        }
+
+    # phase 9: per (family, stealth) cell — the load-bearing block for
+    # "does stealth degrade recall for this family". A stealth-aware
+    # sweep should produce both stealth=true and stealth=false cells
+    # for each agent family; the recall_if_agent delta tells you what
+    # stealth costs the detector.
+    per_family_stealth: dict[str, dict] = {}
+    for i, s in enumerate(test_sess):
+        if not s.family:
+            continue
+        key = f"{s.family}::stealth={'true' if s.stealth else 'false'}"
+        cell = per_family_stealth.setdefault(key, {
+            "family": s.family, "stealth": bool(s.stealth),
+            "kind": s.klass, "test_sessions": 0, "alerts": 0,
+        })
+        cell["test_sessions"] += 1
+        if pred[i] == 1:
+            cell["alerts"] += 1
+    for cell in per_family_stealth.values():
+        n = cell["test_sessions"]
+        rate = cell["alerts"] / max(n, 1)
+        cell["alert_rate"] = rate
+        cell["recall_if_agent"] = rate if cell["kind"] == "agent" else None
+        cell["fp_rate_if_benign"] = (
+            rate if cell["kind"] in ("benign_bot", "human") else None
+        )
+
     pr_curve = None
     try:
         prec, rec, thr = precision_recall_curve(y, scores)
@@ -252,6 +298,8 @@ def evaluate_head(
         "per_source": per_src,
         "per_family": per_family,
         "per_target_app": per_target_app,
+        "per_stealth": per_stealth,
+        "per_family_stealth": per_family_stealth,
         "agent_vs_benign_bot": agent_vs_benign_bot,
         "pr_curve_sample": pr_curve,
     }

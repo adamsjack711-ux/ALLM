@@ -27,6 +27,7 @@ pointed at DVWA at security levels low → high.
 | 8 | Detector eval rollup: per-family / per-target_app / agent-vs-benign_bot + held-out family | ✅ |
 | 9 | Stealth twins of every agent + per-stealth / per-(family, stealth) eval cells | ✅ |
 | 10 | Held-out-stealth eval + orchestrator sweep `{target}×{family}×{security_level}×{stealth}` | ✅ |
+| 11 | Scanner family (nikto / ffuf / raw_httpx / scrapy) + proxy session-schema cache | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -92,7 +93,12 @@ docker compose --profile stealth up -d --build             # 4 stealth twins (fa
 # Phase 10: held-out-stealth eval + orchestrator sweep
 python3 tests/phase10_smoke.py                             # synth-fed, no docker, ~20s
 # or the canonical end-to-end sweep:
-python3 orchestrator/sweep.py --sessions 2                 # ~34 cells, brings up benign continuously
+python3 orchestrator/sweep.py --sessions 2                 # 70 cells (post-phase-11), benign continuous
+
+# Phase 11: scanner family (nikto / ffuf / raw httpx / scrapy) + proxy schema cache
+python3 tests/phase11_smoke.py                             # synth-fed, no docker, ~8s
+# or build + run the new generators by hand:
+docker compose --profile attack-extended up -d --build raw_httpx_bot ffuf_bot scrapy_bot nikto_bot
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -649,14 +655,86 @@ never appears.
 
 ### What phase 10 explicitly does not do
 
-- The 4 remaining scanner generators (nikto, ffuf, raw httpx, Scrapy)
-  and real OpenAI / Gemini PentesterPro. The sweep config skips
-  unknown families; adding them is a one-liner in `_FAMILY_SERVICES`.
-- crAPI as a fourth target. Same story — add a new `_TARGETS` entry
-  and the sweep picks it up.
-- Held-out-(target_app) eval. Conceptually symmetric to held-out-
-  family / held-out-stealth; not asked for in the original spec, so
-  not built.
+- ~~The 4 remaining scanner generators (nikto, ffuf, raw httpx, Scrapy)~~
+  **Phase 11 ships these.**
+- Real OpenAI / Gemini PentesterPro. Phase 12+.
+- crAPI as a fourth target. Phase 12+.
+- Held-out-(target_app) eval. Not asked for in the original spec.
+
+## Phase 11 — scanner family + proxy session-schema cache
+
+The original spec's "non-browser scanners: sqlmap, nikto, ffuf, raw
+httpx/Scrapy" was sqlmap-only after phase 7. Phase 11 ships the
+remaining four under `profiles: ["attack-extended"]`.
+
+### Generators
+
+| family | engine | distinctive HTTP signal |
+|---|---|---|
+| `raw_httpx` | Python + httpx | tight per-request loops, no external tool — rotates SQLi / XSS / path-traversal / CMDi payloads through fixed endpoint list. Sets X-Allm-* natively. |
+| `ffuf` | Go binary (pinned 2.1.0, downloaded at build) | path fuzzer; uses `-H` to attach X-Allm-* to every probe; rate-bounded via `-rate` / `-t` (1 thread + rate 5 in stealth, 10 threads + rate 50 in fast). |
+| `scrapy` | Python Scrapy crawler | `LinkExtractor` walks the site + submits the first form on every page with a SQLi payload. `DEFAULT_REQUEST_HEADERS` attaches X-Allm-* framework-wide. |
+| `nikto` | Perl (sullo/nikto pinned 2.5.0, cloned at build) | comprehensive web vuln scanner. Can't set per-request headers — uses the proxy schema cache (below) plus `-StaticCookies` for sid carriage. Stealth uses `-Tuning x6` + `-Pause 2`. |
+
+All four ship a single image per family; `ALLM_STEALTH=true` at run
+time switches the bot into stealth mode. No separate stealth services
+(would be redundant — the same binary handles both modes).
+
+### Proxy session-schema cache
+
+nikto can't set per-request HTTP headers easily. Phase 11 adds a
+small cache in `capture/proxy.py`:
+
+```
+_session_schema_cache: dict[str, dict]  # session_id -> {class, family, ...}
+_session_src_label_cache: dict[str, str]  # session_id -> src_label
+```
+
+On every request:
+- If the request **carries X-Allm-* headers**, resolve the schema
+  fresh and `setdefault` it into the cache (first-write-wins per sid).
+- If the request **doesn't carry X-Allm-* headers** but the cache has
+  an entry for its sid, hydrate the log row's schema from the cache.
+
+So nikto's bootstrap → labeled httpx request mints the sid + populates
+the cache, then nikto's scan requests inherit the cached labels.
+Result: `requests.jsonl` rows from nikto's scan still carry
+`class=agent, family=nikto, target_app=…`, and `per_family` /
+`per_target_app` slices stay clean instead of collapsing to
+`"unknown"`.
+
+The same cache helps any future tool that follows the bootstrap-then-
+run pattern (raw HTTP-replay attackers, custom scanners, etc).
+
+### Sweep config update
+
+`orchestrator/sweep.py` `_FAMILY_SERVICES` and `_TARGETS` now include
+the four new families. Default sweep grew from **34 cells → 70 cells**
+(VAmPI now covers `sqlmap` + `raw_httpx` + `ffuf`; everything else
+covers all 4 new + 4 old browser/sqlmap families across DVWA +
+Juice Shop, low + medium security, both stealth values).
+
+### Smoke
+
+```sh
+python3 tests/phase11_smoke.py   # synth-fed, no docker, ~8s
+```
+
+Asserts: all 4 modules compile; sweep config covers them and VAmPI
+is non-browser-only (sqlmap + raw_httpx + ffuf); proxy schema cache
+populates from a labeled request and hydrates an unlabeled one (if
+aiohttp is installed locally — otherwise the docker-side smoke
+exercises it for real); synth-feeding the 4 new families through
+train + eval produces `per_family` entries for each, all classified
+as `kind=agent`. No "accuracy" leak.
+
+### What phase 11 explicitly does not do
+
+- Real OpenAI / Gemini PentesterPro (still mocked). Phase 12+.
+- crAPI as a fourth target. Phase 12+.
+- A production-side passive ingest (read real webserver access logs
+  → `requests.jsonl` schema for runtime detection on prod traffic).
+  Phase 13 candidate.
 
 ## Out of scope
 

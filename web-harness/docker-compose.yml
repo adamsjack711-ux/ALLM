@@ -390,6 +390,67 @@ services:
     networks: [allm_lab]
     profiles: ["stealth"]
 
+  # ── phase 11: scanner family — nikto / ffuf / raw httpx / Scrapy ─────
+  # All non-browser, all class=agent. Each picks up ALLM_STEALTH at run
+  # time so the same image covers both stealth values. Under
+  # profiles:["attack-extended"] so existing 1..10 gates stay unaffected.
+
+  raw_httpx_bot:
+    build:
+      context: ./generators
+      dockerfile: raw_httpx/Dockerfile
+    container_name: allm_raw_httpx_bot
+    environment:
+      ALLM_TARGET: ${RAW_HTTPX_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${RAW_HTTPX_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_RAW_HTTPX:-3}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
+  ffuf_bot:
+    build:
+      context: ./generators
+      dockerfile: ffuf_bot/Dockerfile
+    container_name: allm_ffuf_bot
+    environment:
+      ALLM_TARGET: ${FFUF_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${FFUF_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_FFUF:-2}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
+  scrapy_bot:
+    build:
+      context: ./generators
+      dockerfile: scrapy_bot/Dockerfile
+    container_name: allm_scrapy_bot
+    environment:
+      ALLM_TARGET: ${SCRAPY_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${SCRAPY_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_SCRAPY:-2}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
+  nikto_bot:
+    build:
+      context: ./generators
+      dockerfile: nikto_bot/Dockerfile
+    container_name: allm_nikto_bot
+    environment:
+      ALLM_TARGET: ${NIKTO_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${NIKTO_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_NIKTO:-1}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
 networks:
   allm_lab:
     name: allm_lab

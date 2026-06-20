@@ -80,24 +80,28 @@ class SweepConfig:
 
 # Maps target_app → {ALLM_TARGET URL, supported families}. Selenium and
 # Puppeteer drive browsers, which only makes sense against HTML targets;
-# VAmPI is JSON-only so we skip the browser families there. sqlmap and
-# playwright_bot run against everything.
+# VAmPI is JSON-only so we skip the browser families there. sqlmap,
+# playwright_bot, and the phase 11 scanner family run against everything
+# (raw_httpx / ffuf / nikto / scrapy are non-browser and target-agnostic).
 _TARGETS: dict[str, dict] = {
     "dvwa": {
         "url": "http://capture:8080",
-        "families": {"playwright_bot", "sqlmap", "selenium_bot", "puppeteer_bot"},
+        "families": {"playwright_bot", "sqlmap", "selenium_bot",
+                     "puppeteer_bot", "raw_httpx", "ffuf", "scrapy", "nikto"},
     },
     "juice_shop": {
         "url": "http://capture_juiceshop:8080",
-        "families": {"playwright_bot", "sqlmap", "selenium_bot", "puppeteer_bot"},
+        "families": {"playwright_bot", "sqlmap", "selenium_bot",
+                     "puppeteer_bot", "raw_httpx", "ffuf", "scrapy", "nikto"},
     },
     "vampi": {
         "url": "http://capture_vampi:8080",
-        "families": {"sqlmap"},
+        "families": {"sqlmap", "raw_httpx", "ffuf"},
     },
 }
 
 _FAMILY_SERVICES: dict[tuple[str, bool], str] = {
+    # phase 7 — browser bots + sqlmap (stealth twins via phase 9)
     ("playwright_bot", False): "playwright_bot",
     ("playwright_bot", True):  "playwright_bot_stealth",
     ("sqlmap",         False): "sqlmap_bot",
@@ -106,6 +110,16 @@ _FAMILY_SERVICES: dict[tuple[str, bool], str] = {
     ("selenium_bot",   True):  "selenium_bot_stealth",
     ("puppeteer_bot",  False): "puppeteer_bot",
     ("puppeteer_bot",  True):  "puppeteer_bot_stealth",
+    # phase 11 — scanner family (single image per family, ALLM_STEALTH
+    # picks the mode at run time, so no separate stealth service)
+    ("raw_httpx",      False): "raw_httpx_bot",
+    ("raw_httpx",      True):  "raw_httpx_bot",
+    ("ffuf",           False): "ffuf_bot",
+    ("ffuf",           True):  "ffuf_bot",
+    ("scrapy",         False): "scrapy_bot",
+    ("scrapy",         True):  "scrapy_bot",
+    ("nikto",          False): "nikto_bot",
+    ("nikto",          True):  "nikto_bot",
 }
 
 _DEFAULT_BENIGN = [

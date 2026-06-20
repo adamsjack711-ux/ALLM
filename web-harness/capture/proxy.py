@@ -58,6 +58,14 @@ _LEGACY_SRC_TO_LABEL: dict[str, tuple[str, str]] = {
 }
 
 _session_last_seen: dict[str, float] = {}
+# phase 11: schema cache per session. Some attack tools (nikto) can't set
+# per-request headers, so they bootstrap one labelled request via httpx +
+# then run the scan with no per-request label headers. The cache lets the
+# proxy inherit the bootstrap session's class / family / target_app /
+# security_level / stealth fields onto the scan's request rows so the
+# eval per-family and per-target_app slices stay clean.
+_session_schema_cache: dict[str, dict] = {}
+_session_src_label_cache: dict[str, str] = {}
 _log_lock = asyncio.Lock()
 _beacon_lock = asyncio.Lock()
 _sessions_lock = asyncio.Lock()
@@ -125,12 +133,31 @@ def _label_schema_from_request(request: web.Request, src_label: str) -> dict:
     }
 
 
+def _has_allm_label_headers(request: web.Request) -> bool:
+    """True if the request explicitly carries any X-Allm-* label header."""
+    for k in request.headers.keys():
+        if k.lower().startswith("x-allm-"):
+            return True
+    return False
+
+
 @web.middleware
 async def session_and_log_middleware(request: web.Request, handler):
     started = time.time()
     body_in = await request.read()
     sid, is_new = get_or_mint_sid(request)
     label = request.app["label_for"](request)
+    # phase 11: if this request didn't carry an X-Allm-Source but an
+    # earlier request on the same session did, inherit it. Tools like
+    # nikto that can't set per-request headers bootstrap with a labeled
+    # session and then scan; the cache keeps the proxy's per-row labels
+    # consistent across the whole session.
+    if label in ("", "unknown") and not request.app.get("force_label"):
+        cached_label = _session_src_label_cache.get(sid)
+        if cached_label:
+            label = cached_label
+    elif label not in ("", "unknown") and _has_allm_label_headers(request):
+        _session_src_label_cache[sid] = label
     request["_body_in"] = body_in
     request["_sid"] = sid
     request["_is_new"] = is_new
@@ -162,7 +189,17 @@ async def session_and_log_middleware(request: web.Request, handler):
     ctype_full = resp.content_type or ""
     ctype = ctype_full.split(";", 1)[0].strip().lower()
 
-    schema = _label_schema_from_request(request, label)
+    # Schema cache: first time we see an explicitly-labeled request on
+    # this sid, write the schema into the cache. Subsequent requests on
+    # the same sid that DIDN'T set their own X-Allm-* headers inherit
+    # the cached schema so the per-row class/family/target_app stays
+    # consistent across the session.
+    if _has_allm_label_headers(request):
+        schema = _label_schema_from_request(request, label)
+        _session_schema_cache.setdefault(sid, schema)
+    else:
+        cached_schema = _session_schema_cache.get(sid)
+        schema = cached_schema or _label_schema_from_request(request, label)
     log_row = {
         "ts": started,
         "session_id": sid,

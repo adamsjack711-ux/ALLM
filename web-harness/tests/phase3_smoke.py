@@ -28,8 +28,8 @@ REQ = ROOT / "data" / "requests.jsonl"
 HON = ROOT / "data" / "honeypots.jsonl"
 REPORT = ROOT / "data" / "reports" / "phase3.json"
 
-N_BOT = int(os.environ.get("ALLM_PHASE3_BOT", "5"))
-N_HUMAN = int(os.environ.get("ALLM_PHASE3_HUMAN", "5"))
+N_BOT = int(os.environ.get("CERNIS_PHASE3_BOT", "5"))
+N_HUMAN = int(os.environ.get("CERNIS_PHASE3_HUMAN", "5"))
 
 HONEYPOTS = ["invisible_field", "admin_secrets", "canary", "robots_read"]
 
@@ -64,12 +64,12 @@ def main() -> None:
     t0 = time.time()
     rc1 = run([
         "docker", "compose", "--profile", "generators", "run", "--rm",
-        "-e", f"ALLM_SESSIONS={N_BOT}",
+        "-e", f"CERNIS_SESSIONS={N_BOT}",
         "playwright_bot",
     ])
     rc2 = run([
         "docker", "compose", "--profile", "generators", "run", "--rm",
-        "-e", f"ALLM_SESSIONS={N_HUMAN}",
+        "-e", f"CERNIS_SESSIONS={N_HUMAN}",
         "human_sim",
     ])
     if rc1 or rc2:

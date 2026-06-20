@@ -31,7 +31,7 @@ REQ = ROOT / "data" / "requests.jsonl"
 HON = ROOT / "data" / "honeypots.jsonl"
 REPORTS = ROOT / "data" / "reports"
 
-N = int(os.environ.get("ALLM_PHASE5_SESSIONS", "6"))
+N = int(os.environ.get("CERNIS_PHASE5_SESSIONS", "6"))
 
 
 def run(cmd: list[str], check: bool = False) -> int:

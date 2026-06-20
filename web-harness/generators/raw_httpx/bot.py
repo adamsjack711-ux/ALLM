@@ -11,7 +11,7 @@ Distinct from sqlmap on the wire in two ways:
   - payload structure: rotates through a small fixed list per endpoint
     instead of sqlmap's mutation engine.
 
-Every request carries X-Allm-* headers because httpx supports a
+Every request carries X-Cernis-* headers because httpx supports a
 per-Client headers dict. No need for the proxy schema cache here.
 """
 
@@ -30,10 +30,10 @@ from target_guard import get_target  # noqa: E402
 
 LABEL = "raw_httpx"
 TARGET = get_target()
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa").strip().lower()
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa").strip().lower()
 SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "3"))
-STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "3"))
+STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
     "1", "true", "yes",
 )
 

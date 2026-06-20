@@ -1,4 +1,4 @@
-"""Feature extraction for the ALLM web detector.
+"""Feature extraction for the CERNIS web detector.
 
 Loads three JSONL files from `--data`:
   requests.jsonl   one row per HTTP request through the capture proxy
@@ -33,7 +33,7 @@ import numpy as np
 # from phases 1-5 (pre-phase-6 data has no `class` column). Phase 7
 # generators (sqlmap / selenium_bot / puppeteer_bot) are listed here too
 # so eval still computes y correctly even if the proxy somehow dropped
-# the X-Allm-Class header.
+# the X-Cernis-Class header.
 AGENT_LABELS = frozenset({
     "playwright_bot", "pentesterpro",
     "sqlmap", "selenium_bot", "puppeteer_bot",
@@ -48,7 +48,7 @@ HONEYPOT_NAMES = ("canary", "invisible_field", "admin_secrets", "robots_read")
 
 
 def derive_class_from_label(src_label: str) -> str:
-    """Legacy mapping for rows that pre-date the X-Allm-Class header."""
+    """Legacy mapping for rows that pre-date the X-Cernis-Class header."""
     if src_label in AGENT_LABELS:
         return "agent"
     if src_label in BENIGN_BOT_LABELS:

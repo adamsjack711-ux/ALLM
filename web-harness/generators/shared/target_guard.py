@@ -1,7 +1,7 @@
 """Loopback-only target guard for traffic generators.
 
 Every generator must call `get_target()` instead of accepting URLs from CLI.
-The target is read from the `ALLM_TARGET` env var and the host must be one
+The target is read from the `CERNIS_TARGET` env var and the host must be one
 of an allow-list: the docker network aliases for the capture proxies, or
 a loopback name (127.0.0.1 / ::1 / localhost). Any non-http(s) scheme or
 unlisted host hard-exits the process before any network I/O happens.
@@ -45,11 +45,11 @@ def assert_loopback_target(url: str) -> str:
 
 
 def get_target() -> str:
-    url = os.environ.get("ALLM_TARGET", "").strip()
+    url = os.environ.get("CERNIS_TARGET", "").strip()
     if not url:
-        raise SystemExit("[target_guard] ALLM_TARGET env var is required")
+        raise SystemExit("[target_guard] CERNIS_TARGET env var is required")
     target = assert_loopback_target(url)
-    print(f"[target_guard] ALLM_TARGET={target} (allowed)", file=sys.stderr)
+    print(f"[target_guard] CERNIS_TARGET={target} (allowed)", file=sys.stderr)
     return target
 
 

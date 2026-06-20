@@ -10,7 +10,7 @@ tmpdir, runs the shipper in --once mode, and asserts:
      within a quiet stretch.
   3. The resulting requests.jsonl rows carry the production schema
      (class=unknown, family=prod_traffic, target_app=prod) and don't
-     leak any of the lab artifacts (no allm_sid mention, no honeypot
+     leak any of the lab artifacts (no cernis_sid mention, no honeypot
      fields).
   4. The output feeds through detector/features.build_sessions
      cleanly — Session objects come back with the right resolved

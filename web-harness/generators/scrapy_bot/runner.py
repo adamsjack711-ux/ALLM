@@ -1,8 +1,8 @@
 """Scrapy-based agent — link-following crawler that pokes forms.
 
-Scrapy's DEFAULT_REQUEST_HEADERS setting attaches X-Allm-* to every
+Scrapy's DEFAULT_REQUEST_HEADERS setting attaches X-Cernis-* to every
 request the framework issues, so no proxy schema cache needed. We do
-a single bootstrap pass through httpx first to mint allm_sid + write
+a single bootstrap pass through httpx first to mint cernis_sid + write
 provenance, then point Scrapy at the same target with the captured
 cookie in DEFAULT_REQUEST_HEADERS.
 
@@ -25,16 +25,16 @@ from target_guard import get_target  # noqa: E402
 
 LABEL = "scrapy"
 TARGET = get_target()
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa").strip().lower()
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa").strip().lower()
 SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "2"))
-STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "2"))
+STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
     "1", "true", "yes",
 )
 
 
 def _bootstrap_session(payload: dict) -> dict:
-    """Mint allm_sid + write provenance; return the cookies dict for Scrapy."""
+    """Mint cernis_sid + write provenance; return the cookies dict for Scrapy."""
     headers = headers_for(payload) | {"User-Agent": "Scrapy/2.11"}
     with httpx.Client(base_url=TARGET, headers=headers,
                       timeout=10.0, follow_redirects=False) as client:
@@ -57,7 +57,7 @@ def _crawl(payload: dict, cookies: dict) -> int:
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
     class _Spider(CrawlSpider):
-        name = "allm_scrapy_bot"
+        name = "cernis_scrapy_bot"
         start_urls = [TARGET]
         custom_settings = {
             "ROBOTSTXT_OBEY": False,

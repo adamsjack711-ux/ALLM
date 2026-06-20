@@ -1,7 +1,7 @@
 """Per-session provenance helper for traffic generators.
 
 Every generator should call `record_provenance(...)` once per session,
-after its first request has minted an `allm_sid` cookie. The capture
+after its first request has minted an `cernis_sid` cookie. The capture
 proxy upserts a row into `data/sessions.jsonl` keyed by that sid:
 
     {ts, session_id, src_label, class, family, target_app,
@@ -9,12 +9,12 @@ proxy upserts a row into `data/sessions.jsonl` keyed by that sid:
      generator_config_sha, extra}
 
 The same labels also flow through every per-request log row via the
-X-Allm-* headers each generator already sets on its session.
+X-Cernis-* headers each generator already sets on its session.
 
 The helper uses httpx because it's a lighter dep than Playwright's
 context client and works for non-browser generators too. Browser-based
 generators can call `record_provenance_from_context()` to reuse the
-Playwright APIRequestContext (sharing the same `allm_sid` cookie).
+Playwright APIRequestContext (sharing the same `cernis_sid` cookie).
 """
 
 from __future__ import annotations
@@ -58,19 +58,19 @@ def build_payload(
 
 
 def headers_for(payload: dict) -> dict:
-    """The same labels mirrored into X-Allm-* headers on every request.
+    """The same labels mirrored into X-Cernis-* headers on every request.
 
     Generators set these on each HTTP request so the capture proxy can
     persist them per-row (which is what the detector reads), independent
     of the one-shot provenance POST.
     """
     return {
-        "X-Allm-Source": payload["family"],
-        "X-Allm-Class": payload["class"],
-        "X-Allm-Family": payload["family"],
-        "X-Allm-TargetApp": payload["target_app"],
-        "X-Allm-SecurityLevel": payload["security_level"],
-        "X-Allm-Stealth": "true" if payload["stealth"] else "false",
+        "X-Cernis-Source": payload["family"],
+        "X-Cernis-Class": payload["class"],
+        "X-Cernis-Family": payload["family"],
+        "X-Cernis-TargetApp": payload["target_app"],
+        "X-Cernis-SecurityLevel": payload["security_level"],
+        "X-Cernis-Stealth": "true" if payload["stealth"] else "false",
     }
 
 
@@ -80,7 +80,7 @@ def record_provenance_httpx(
     """POST the provenance row via an httpx.Client (sync) or AsyncClient.
 
     The client should already have made at least one request to `target`
-    so that an `allm_sid` cookie is in its jar; the proxy uses that
+    so that an `cernis_sid` cookie is in its jar; the proxy uses that
     cookie to key the row. We don't fail the generator if the proxy is
     momentarily unavailable — the request log is the source of truth and
     a missing provenance row just means eval falls back to legacy
@@ -98,7 +98,7 @@ async def record_provenance_playwright(
     ctx_request: Any, target: str, payload: dict, *, timeout_ms: int = 5000
 ) -> None:
     """POST provenance via a Playwright APIRequestContext bound to the
-    same BrowserContext as the session — so the existing `allm_sid`
+    same BrowserContext as the session — so the existing `cernis_sid`
     cookie travels with it."""
     url = f"{target.rstrip('/')}/__provenance"
     try:

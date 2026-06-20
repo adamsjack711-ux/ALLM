@@ -43,7 +43,7 @@ def wait_for_html(opener: ur.OpenerDirector, url: str, timeout: float = 60.0):
         try:
             req = ur.Request(url, headers={
                 "Authorization": LEAK_TOKEN,
-                "User-Agent": "allm-smoke/1.0",
+                "User-Agent": "cernis-smoke/1.0",
             })
             resp = opener.open(req, timeout=10)
             body = resp.read()
@@ -73,15 +73,15 @@ def main() -> None:
     opener.addheaders = []
 
     r1, body1 = wait_for_html(opener, f"http://127.0.0.1:{CAPTURE_PORT}/login.php")
-    sids = [c.value for c in jar if c.name == "allm_sid"]
-    assert sids, f"[smoke] no allm_sid cookie minted; jar={[c.name for c in jar]}"
+    sids = [c.value for c in jar if c.name == "cernis_sid"]
+    assert sids, f"[smoke] no cernis_sid cookie minted; jar={[c.name for c in jar]}"
     sid = sids[0]
     assert b"/__beacon.js" in body1, "[smoke] beacon <script src=/__beacon.js> tag missing from HTML"
 
     time.sleep(0.2)
     req2 = ur.Request(
         f"http://127.0.0.1:{CAPTURE_PORT}/login.php",
-        headers={"Authorization": LEAK_TOKEN, "User-Agent": "allm-smoke/1.0"},
+        headers={"Authorization": LEAK_TOKEN, "User-Agent": "cernis-smoke/1.0"},
     )
     r2 = opener.open(req2, timeout=10)
     r2.read()

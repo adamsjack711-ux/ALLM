@@ -12,7 +12,7 @@ live traffic without further plumbing.
 ## Why not just run the capture proxy in front of production?
 
 The lab capture proxy intentionally has hostile-to-production
-behaviors that surface attacker signal: it mints its own `allm_sid`
+behaviors that surface attacker signal: it mints its own `cernis_sid`
 cookie (would collide with prod session cookies), injects a JS beacon
 on every HTML response (changes prod page behavior), and **injects
 honeypots** (`/__canary`, hidden form fields, fake `robots.txt`
@@ -89,7 +89,7 @@ exactly this "less signal, still meaningful" case.
 ```sh
 python3 -m ingest.access_log_shipper \
     --log /var/log/nginx/access.log \
-    --out /opt/allm/data/requests.jsonl \
+    --out /opt/cernis/data/requests.jsonl \
     --once \
     --target-app prod \
     --family prod_traffic
@@ -100,7 +100,7 @@ python3 -m ingest.access_log_shipper \
 ```sh
 python3 -m ingest.access_log_shipper \
     --log /var/log/nginx/access.log \
-    --out /opt/allm/data/requests.jsonl \
+    --out /opt/cernis/data/requests.jsonl \
     --follow \
     --target-app prod
 ```
@@ -116,9 +116,9 @@ Once the shipper is populating that file:
 ```sh
 # one-shot scoring against a trained model
 python3 detector/eval.py \
-    --data /opt/allm/data \
+    --data /opt/cernis/data \
     --models /path/to/lab-trained-models \
-    --out /opt/allm/data/reports/prod_eval.json \
+    --out /opt/cernis/data/reports/prod_eval.json \
     --fp-per-hour-budget 1.0
 ```
 

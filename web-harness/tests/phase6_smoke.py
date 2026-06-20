@@ -46,7 +46,7 @@ SCHEMA_FIELDS = (
     "class", "family", "target_app", "security_level", "stealth",
     "generator", "generator_version", "generator_config_sha",
 )
-WAIT_BUDGET_S = int(os.environ.get("ALLM_PHASE6_WAIT_S", "180"))
+WAIT_BUDGET_S = int(os.environ.get("CERNIS_PHASE6_WAIT_S", "180"))
 
 
 def run(cmd: list[str], check: bool = False) -> int:

@@ -7,7 +7,7 @@ COPY shared /app/shared
 COPY human_sim/sim.py /app/
 
 ENV PYTHONUNBUFFERED=1 \
-    ALLM_TARGET=http://capture:8080 \
+    CERNIS_TARGET=http://capture:8080 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 CMD ["python3", "/app/sim.py"]

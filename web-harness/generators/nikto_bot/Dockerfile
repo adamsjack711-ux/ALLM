@@ -21,6 +21,6 @@ COPY nikto_bot /app/nikto_bot
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    ALLM_TARGET=http://capture:8080
+    CERNIS_TARGET=http://capture:8080
 
 CMD ["python3", "/app/nikto_bot/wrapper.py"]

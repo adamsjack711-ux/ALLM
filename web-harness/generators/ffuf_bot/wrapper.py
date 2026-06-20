@@ -1,12 +1,12 @@
 """ffuf fuzzer wrapper.
 
 Runs ffuf in path-fuzzing mode against the target. ffuf's `-H` flag
-sets headers on every fuzz request, so X-Allm-* labels travel with the
+sets headers on every fuzz request, so X-Cernis-* labels travel with the
 scan natively (no proxy schema cache needed here).
 
 Two-phase per session:
   1. Bootstrap session via httpx (one request) + write provenance.
-  2. Run ffuf with the captured allm_sid cookie + X-Allm-* headers +
+  2. Run ffuf with the captured cernis_sid cookie + X-Cernis-* headers +
      a small wordlist. ffuf does the rest.
 
 Stealth mode lowers the rate (-rate 5 instead of -rate 50) and shrinks
@@ -29,10 +29,10 @@ from target_guard import get_target  # noqa: E402
 
 LABEL = "ffuf"
 TARGET = get_target()
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa").strip().lower()
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa").strip().lower()
 SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "2"))
-STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "2"))
+STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
     "1", "true", "yes",
 )
 FFUF_TIMEOUT_S = int(os.environ.get("FFUF_TIMEOUT_S", "180"))
@@ -40,7 +40,7 @@ WORDLIST = pathlib.Path("/app/ffuf_bot/wordlist.txt")
 
 
 def _bootstrap_session(payload: dict) -> str:
-    """Mint allm_sid + write provenance; return cookie string for ffuf."""
+    """Mint cernis_sid + write provenance; return cookie string for ffuf."""
     headers = headers_for(payload) | {"User-Agent": "ffuf/2.1"}
     with httpx.Client(base_url=TARGET, headers=headers,
                       timeout=10.0, follow_redirects=False) as client:

@@ -1,4 +1,4 @@
-# allm-web-harness — phase 1
+# cernis-web-harness — phase 1
 # DVWA + MariaDB + capture proxy on a single bridge network.
 # Only the capture proxy publishes a host port, bound to 127.0.0.1.
 # Generators / detector / orchestrator land in later phases.
@@ -6,7 +6,7 @@
 services:
   db:
     image: mariadb:10.11
-    container_name: allm_db
+    container_name: cernis_db
     environment:
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-dvwa_root}
       MARIADB_DATABASE: ${DB_NAME:-dvwa}
@@ -17,13 +17,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    networks: [allm_lab]
+    networks: [cernis_lab]
     restart: unless-stopped
 
   dvwa:
     # ghcr.io/digininja/dvwa:latest — pin to a sha after first successful pull (see README).
     image: ghcr.io/digininja/dvwa:latest
-    container_name: allm_dvwa
+    container_name: cernis_dvwa
     environment:
       DB_SERVER: db
       DB_DATABASE: ${DB_NAME:-dvwa}
@@ -33,12 +33,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    networks: [allm_lab]
+    networks: [cernis_lab]
     restart: unless-stopped
 
   capture:
     build: ./capture
-    container_name: allm_capture
+    container_name: cernis_capture
     environment:
       UPSTREAM: http://dvwa:80
       DATA_DIR: /data
@@ -46,67 +46,67 @@ services:
       - ./data:/data
     ports:
       # 8090 is the human-capture port — host loopback only.
-      # 8080 is intentionally NOT published; reachable only on allm_lab.
+      # 8080 is intentionally NOT published; reachable only on cernis_lab.
       - "127.0.0.1:8090:8090"
     depends_on:
       - dvwa
-    networks: [allm_lab]
+    networks: [cernis_lab]
     restart: unless-stopped
 
   playwright_bot:
     build:
       context: ./generators
       dockerfile: playwright_bot/Dockerfile
-    container_name: allm_playwright_bot
+    container_name: cernis_playwright_bot
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BOT:-10}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BOT:-10}
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["generators"]
 
   human_sim:
     build:
       context: ./generators
       dockerfile: human_sim/Dockerfile
-    container_name: allm_human_sim
+    container_name: cernis_human_sim
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_SESSIONS: ${ALLM_SESSIONS_HUMAN:-10}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_HUMAN:-10}
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["generators"]
 
   pentesterpro:
     build:
       context: ./generators
       dockerfile: pentesterpro/Dockerfile
-    container_name: allm_pentesterpro
+    container_name: cernis_pentesterpro
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_SESSIONS: ${ALLM_SESSIONS_PPRO:-10}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_PPRO:-10}
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["generators"]
 
   detector:
     build: ./detector
-    container_name: allm_detector
+    container_name: cernis_detector
     volumes:
       - ./data:/data
     profiles: ["analysis"]
 
   # ── benign_bot family (negative class) ───────────────────────────────
-  # All five services share the same image; ALLM_BENIGN_BOT picks which
+  # All five services share the same image; CERNIS_BENIGN_BOT picks which
   # family runs. They don't publish ports and only start under the
   # `benign` profile, so existing phase-1..5 smoke tests are unaffected.
 
@@ -114,133 +114,133 @@ services:
     build:
       context: ./generators
       dockerfile: benign_bots/Dockerfile
-    image: allm-benign-bots:latest
-    container_name: allm_benign_googlebot
+    image: cernis-benign-bots:latest
+    container_name: cernis_benign_googlebot
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_BENIGN_BOT: googlebot
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_BENIGN_BOT: googlebot
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BENIGN:-3}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["benign"]
 
   benign_uptime:
-    image: allm-benign-bots:latest
+    image: cernis-benign-bots:latest
     build:
       context: ./generators
       dockerfile: benign_bots/Dockerfile
-    container_name: allm_benign_uptime
+    container_name: cernis_benign_uptime
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_BENIGN_BOT: uptime
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_BENIGN_BOT: uptime
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BENIGN:-3}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["benign"]
 
   benign_rss:
-    image: allm-benign-bots:latest
+    image: cernis-benign-bots:latest
     build:
       context: ./generators
       dockerfile: benign_bots/Dockerfile
-    container_name: allm_benign_rss
+    container_name: cernis_benign_rss
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_BENIGN_BOT: rss
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_BENIGN_BOT: rss
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BENIGN:-3}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["benign"]
 
   benign_unfurl:
-    image: allm-benign-bots:latest
+    image: cernis-benign-bots:latest
     build:
       context: ./generators
       dockerfile: benign_bots/Dockerfile
-    container_name: allm_benign_unfurl
+    container_name: cernis_benign_unfurl
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_BENIGN_BOT: unfurl
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_BENIGN_BOT: unfurl
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BENIGN:-3}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["benign"]
 
   benign_ci:
-    image: allm-benign-bots:latest
+    image: cernis-benign-bots:latest
     build:
       context: ./generators
       dockerfile: benign_bots/Dockerfile
-    container_name: allm_benign_ci
+    container_name: cernis_benign_ci
     environment:
-      ALLM_TARGET: http://capture:8080
-      ALLM_BENIGN_BOT: ci
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+      CERNIS_TARGET: http://capture:8080
+      CERNIS_BENIGN_BOT: ci
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BENIGN:-3}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["benign"]
 
   # ── phase 7: additional vulnerable targets + sibling captures ────────
   # Each new target gets its own capture container fronting it; all share
-  # the same proxy image but with different UPSTREAM + ALLM_TARGET_APP.
+  # the same proxy image but with different UPSTREAM + CERNIS_TARGET_APP.
   # No new published host ports — only the original `capture:8090` is
   # host-visible, and that one still goes to DVWA.
 
   juiceshop:
     image: bkimminich/juice-shop:latest
-    container_name: allm_juiceshop
-    networks: [allm_lab]
+    container_name: cernis_juiceshop
+    networks: [cernis_lab]
     profiles: ["multitarget"]
     restart: unless-stopped
 
   capture_juiceshop:
     build: ./capture
-    image: allm-capture:latest
-    container_name: allm_capture_juiceshop
+    image: cernis-capture:latest
+    container_name: cernis_capture_juiceshop
     environment:
       UPSTREAM: http://juiceshop:3000
-      ALLM_TARGET_APP: juice_shop
+      CERNIS_TARGET_APP: juice_shop
       DATA_DIR: /data
     volumes:
       - ./data:/data
     depends_on:
       - juiceshop
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["multitarget"]
     restart: unless-stopped
 
   webgoat:
     image: webgoat/webgoat:latest
-    container_name: allm_webgoat
-    networks: [allm_lab]
+    container_name: cernis_webgoat
+    networks: [cernis_lab]
     profiles: ["multitarget"]
     restart: unless-stopped
 
   capture_webgoat:
     build: ./capture
-    image: allm-capture:latest
-    container_name: allm_capture_webgoat
+    image: cernis-capture:latest
+    container_name: cernis_capture_webgoat
     environment:
       UPSTREAM: http://webgoat:8080
-      ALLM_TARGET_APP: webgoat
+      CERNIS_TARGET_APP: webgoat
       DATA_DIR: /data
     volumes:
       - ./data:/data
     depends_on:
       - webgoat
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["multitarget"]
     restart: unless-stopped
 
   vampi:
     image: erev0s/vampi:latest
-    container_name: allm_vampi
-    networks: [allm_lab]
+    container_name: cernis_vampi
+    networks: [cernis_lab]
     profiles: ["multitarget"]
     restart: unless-stopped
 
@@ -249,17 +249,17 @@ services:
 
   capture_vampi:
     build: ./capture
-    image: allm-capture:latest
-    container_name: allm_capture_vampi
+    image: cernis-capture:latest
+    container_name: cernis_capture_vampi
     environment:
       UPSTREAM: http://vampi:5000
-      ALLM_TARGET_APP: vampi
+      CERNIS_TARGET_APP: vampi
       DATA_DIR: /data
     volumes:
       - ./data:/data
     depends_on:
       - vampi
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["multitarget"]
     restart: unless-stopped
 
@@ -274,52 +274,52 @@ services:
     build:
       context: ./generators
       dockerfile: sqlmap_bot/Dockerfile
-    container_name: allm_sqlmap_bot
+    container_name: cernis_sqlmap_bot
     environment:
-      ALLM_TARGET: ${SQLMAP_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${SQLMAP_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_SQLMAP:-2}
+      CERNIS_TARGET: ${SQLMAP_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${SQLMAP_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_SQLMAP:-2}
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   selenium_bot:
     build:
       context: ./generators
       dockerfile: selenium_bot/Dockerfile
-    container_name: allm_selenium_bot
+    container_name: cernis_selenium_bot
     environment:
-      ALLM_TARGET: ${SELENIUM_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${SELENIUM_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_SELENIUM:-3}
+      CERNIS_TARGET: ${SELENIUM_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${SELENIUM_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_SELENIUM:-3}
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   puppeteer_bot:
     build:
       context: ./generators
       dockerfile: puppeteer_bot/Dockerfile
-    container_name: allm_puppeteer_bot
+    container_name: cernis_puppeteer_bot
     environment:
-      ALLM_TARGET: ${PUPPETEER_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${PUPPETEER_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_PUPPETEER:-3}
+      CERNIS_TARGET: ${PUPPETEER_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${PUPPETEER_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_PUPPETEER:-3}
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   # ── phase 9: stealth twins (family stays the same; stealth=true) ─────
-  # Each reuses the matching non-stealth image and toggles ALLM_STEALTH
+  # Each reuses the matching non-stealth image and toggles CERNIS_STEALTH
   # so the bot picks the slow / honeypot-avoidant code paths. Family in
   # the manifest stays unchanged (playwright_bot / sqlmap / selenium_bot
   # / puppeteer_bot) — only the `stealth` axis differs. Eval slices on
@@ -329,72 +329,72 @@ services:
     build:
       context: ./generators
       dockerfile: playwright_bot/Dockerfile
-    container_name: allm_playwright_bot_stealth
+    container_name: cernis_playwright_bot_stealth
     environment:
-      ALLM_TARGET: ${PLAYWRIGHT_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${PLAYWRIGHT_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_BOT:-5}
-      ALLM_STEALTH: "true"
+      CERNIS_TARGET: ${PLAYWRIGHT_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${PLAYWRIGHT_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_BOT:-5}
+      CERNIS_STEALTH: "true"
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["stealth"]
 
   sqlmap_stealth:
     build:
       context: ./generators
       dockerfile: sqlmap_bot/Dockerfile
-    container_name: allm_sqlmap_stealth
+    container_name: cernis_sqlmap_stealth
     environment:
-      ALLM_TARGET: ${SQLMAP_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${SQLMAP_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_SQLMAP:-1}
-      ALLM_STEALTH: "true"
+      CERNIS_TARGET: ${SQLMAP_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${SQLMAP_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_SQLMAP:-1}
+      CERNIS_STEALTH: "true"
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["stealth"]
 
   selenium_bot_stealth:
     build:
       context: ./generators
       dockerfile: selenium_bot/Dockerfile
-    container_name: allm_selenium_bot_stealth
+    container_name: cernis_selenium_bot_stealth
     environment:
-      ALLM_TARGET: ${SELENIUM_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${SELENIUM_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_SELENIUM:-3}
-      ALLM_STEALTH: "true"
+      CERNIS_TARGET: ${SELENIUM_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${SELENIUM_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_SELENIUM:-3}
+      CERNIS_STEALTH: "true"
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["stealth"]
 
   puppeteer_bot_stealth:
     build:
       context: ./generators
       dockerfile: puppeteer_bot/Dockerfile
-    container_name: allm_puppeteer_bot_stealth
+    container_name: cernis_puppeteer_bot_stealth
     environment:
-      ALLM_TARGET: ${PUPPETEER_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${PUPPETEER_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_PUPPETEER:-3}
-      ALLM_STEALTH: "true"
+      CERNIS_TARGET: ${PUPPETEER_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${PUPPETEER_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_PUPPETEER:-3}
+      CERNIS_STEALTH: "true"
       DVWA_USER: ${DVWA_USER:-admin}
       DVWA_PASS: ${DVWA_PASS:-password}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["stealth"]
 
   # ── phase 11: scanner family — nikto / ffuf / raw httpx / Scrapy ─────
-  # All non-browser, all class=agent. Each picks up ALLM_STEALTH at run
+  # All non-browser, all class=agent. Each picks up CERNIS_STEALTH at run
   # time so the same image covers both stealth values. Under
   # profiles:["attack-extended"] so existing 1..10 gates stay unaffected.
 
@@ -402,56 +402,56 @@ services:
     build:
       context: ./generators
       dockerfile: raw_httpx/Dockerfile
-    container_name: allm_raw_httpx_bot
+    container_name: cernis_raw_httpx_bot
     environment:
-      ALLM_TARGET: ${RAW_HTTPX_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${RAW_HTTPX_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_RAW_HTTPX:-3}
+      CERNIS_TARGET: ${RAW_HTTPX_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${RAW_HTTPX_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_RAW_HTTPX:-3}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   ffuf_bot:
     build:
       context: ./generators
       dockerfile: ffuf_bot/Dockerfile
-    container_name: allm_ffuf_bot
+    container_name: cernis_ffuf_bot
     environment:
-      ALLM_TARGET: ${FFUF_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${FFUF_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_FFUF:-2}
+      CERNIS_TARGET: ${FFUF_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${FFUF_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_FFUF:-2}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   scrapy_bot:
     build:
       context: ./generators
       dockerfile: scrapy_bot/Dockerfile
-    container_name: allm_scrapy_bot
+    container_name: cernis_scrapy_bot
     environment:
-      ALLM_TARGET: ${SCRAPY_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${SCRAPY_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_SCRAPY:-2}
+      CERNIS_TARGET: ${SCRAPY_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${SCRAPY_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_SCRAPY:-2}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   nikto_bot:
     build:
       context: ./generators
       dockerfile: nikto_bot/Dockerfile
-    container_name: allm_nikto_bot
+    container_name: cernis_nikto_bot
     environment:
-      ALLM_TARGET: ${NIKTO_TARGET:-http://capture:8080}
-      ALLM_TARGET_APP: ${NIKTO_TARGET_APP:-dvwa}
-      ALLM_SESSIONS: ${ALLM_SESSIONS_NIKTO:-1}
+      CERNIS_TARGET: ${NIKTO_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${NIKTO_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_NIKTO:-1}
     depends_on:
       - capture
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["attack-extended"]
 
   # ── phase 12: crAPI fourth target (OWASP API security demo) ──────────
@@ -470,41 +470,41 @@ services:
 
   crapi_mongodb:
     image: mongo:6
-    container_name: allm_crapi_mongodb
+    container_name: cernis_crapi_mongodb
     environment:
       MONGO_INITDB_ROOT_USERNAME: crapi
       MONGO_INITDB_ROOT_PASSWORD: crapi
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   crapi_postgresdb:
     image: postgres:14
-    container_name: allm_crapi_postgresdb
+    container_name: cernis_crapi_postgresdb
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: crapisecretpassword
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   crapi_mailhog:
     image: mailhog/mailhog:latest
-    container_name: allm_crapi_mailhog
-    networks: [allm_lab]
+    container_name: cernis_crapi_mailhog
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   crapi_rabbitmq:
     image: rabbitmq:3-management-alpine
-    container_name: allm_crapi_rabbitmq
-    networks: [allm_lab]
+    container_name: cernis_crapi_rabbitmq
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   crapi_identity:
     image: crapi/crapi-identity:latest
-    container_name: allm_crapi_identity
+    container_name: cernis_crapi_identity
     environment:
       DB_NAME: crapi
       DB_USER: admin
@@ -516,13 +516,13 @@ services:
     depends_on:
       - crapi_postgresdb
       - crapi_mailhog
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   crapi_community:
     image: crapi/crapi-community:latest
-    container_name: allm_crapi_community
+    container_name: cernis_crapi_community
     environment:
       MONGO_DB_HOST: crapi_mongodb
       MONGO_DB_PORT: 27017
@@ -534,13 +534,13 @@ services:
     depends_on:
       - crapi_mongodb
       - crapi_identity
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   crapi_workshop:
     image: crapi/crapi-workshop:latest
-    container_name: allm_crapi_workshop
+    container_name: cernis_crapi_workshop
     environment:
       DB_NAME: crapi
       DB_USER: admin
@@ -560,7 +560,7 @@ services:
       - crapi_postgresdb
       - crapi_identity
       - crapi_rabbitmq
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
@@ -569,7 +569,7 @@ services:
     # community / workshop so capture_crapi sees the full API surface
     # from one upstream.
     image: crapi/crapi-web:latest
-    container_name: allm_crapi
+    container_name: cernis_crapi
     environment:
       IDENTITY_SERVICE_HOST: crapi_identity
       IDENTITY_SERVICE_PORT: 8080
@@ -581,27 +581,27 @@ services:
       - crapi_identity
       - crapi_community
       - crapi_workshop
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
   capture_crapi:
     build: ./capture
-    image: allm-capture:latest
-    container_name: allm_capture_crapi
+    image: cernis-capture:latest
+    container_name: cernis_capture_crapi
     environment:
       UPSTREAM: http://crapi:8888
-      ALLM_TARGET_APP: crapi
+      CERNIS_TARGET_APP: crapi
       DATA_DIR: /data
     volumes:
       - ./data:/data
     depends_on:
       - crapi
-    networks: [allm_lab]
+    networks: [cernis_lab]
     profiles: ["crapi"]
     restart: unless-stopped
 
 networks:
-  allm_lab:
-    name: allm_lab
+  cernis_lab:
+    name: cernis_lab
     driver: bridge

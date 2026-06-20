@@ -1,4 +1,4 @@
-# allm-web-harness
+# cernis-web-harness
 
 Localhost-only purple-team test harness that asks: **is this web visitor an
 autonomous LLM agent or a human?** DVWA is the deliberately vulnerable
@@ -34,10 +34,10 @@ pointed at DVWA at security levels low → high.
 ## Hard constraints (enforced in code, not docs)
 
 - All ports are loopback / internal. Only the capture proxy publishes
-  `127.0.0.1:8090`. Generator services run on the `allm_lab` bridge
+  `127.0.0.1:8090`. Generator services run on the `cernis_lab` bridge
   network and never expose ports.
 - Each traffic generator imports `generators/shared/target_guard.py` and
-  reads its target from `ALLM_TARGET` only. The guard rejects any host
+  reads its target from `CERNIS_TARGET` only. The guard rejects any host
   whose name isn't in `{capture, capture_dvwa, capture_juiceshop,
   capture_webgoat, capture_vampi, 127.0.0.1, ::1, localhost}` — hard
   process exit before any I/O. CLI overrides are deliberately not
@@ -54,7 +54,7 @@ pointed at DVWA at security levels low → high.
 ## Run
 
 ```sh
-cd ~/allm-web-harness
+cd ~/cernis-web-harness
 cp .env.example .env                  # optional; defaults are fine
 
 # Phase 1: target + capture
@@ -126,7 +126,7 @@ sessions exactly like the generators.
 ## Architecture
 
 ```
-                docker network: allm_lab
+                docker network: cernis_lab
  ┌─────────────────────────────────────────────────────────────────┐
  │                                                                 │
  │  generators/        ─┐                                          │
@@ -145,7 +145,7 @@ sessions exactly like the generators.
 ```
 
 Two listeners on the capture proxy: `:8080` is bound only inside the
-docker network and labels incoming sessions from the `X-Allm-Source`
+docker network and labels incoming sessions from the `X-Cernis-Source`
 header (set by each generator container). `:8090` is host-loopback and
 hard-labels every session `human_real`.
 
@@ -248,7 +248,7 @@ locked the harness to a Mock LLM (no Gemini egress). `generators/pentesterpro/`
 implements that as a **behavioral stand-in**: same multi-step plan/act
 loop, same hidden-DOM-reading reasoning, deterministic local planner in
 `mock_llm.py` instead of the Gemini call PentesterPro would otherwise
-make. The X-Allm-Source label is `pentesterpro`.
+make. The X-Cernis-Source label is `pentesterpro`.
 
 Why not run the real PentesterPro framework?
 
@@ -275,7 +275,7 @@ from the references at `Hellsender01/PentesterPro:main_scan.py:47` and
 ## Layout
 
 ```
-allm-web-harness/
+cernis-web-harness/
 ├── docker-compose.yml          # db + dvwa + capture + generators + detector
 ├── capture/                    # aiohttp proxy + JS beacon + honeypot layer
 │   ├── proxy.py                # middleware: session, redacted log, honeypot check
@@ -283,7 +283,7 @@ allm-web-harness/
 │   ├── beacon.js               # injected on every HTML response
 │   ├── Dockerfile, requirements.txt
 ├── generators/
-│   ├── shared/target_guard.py  # loopback-only ALLM_TARGET enforcer
+│   ├── shared/target_guard.py  # loopback-only CERNIS_TARGET enforcer
 │   ├── shared/manifest.py      # provenance helper (httpx + Playwright variants)
 │   ├── playwright_bot/         # spray fuzzer: greedy form fill + robots recon
 │   ├── human_sim/              # slow typing + mouse jitter + dwell
@@ -338,7 +338,7 @@ all non-stealthy (`stealth=false`) — stealth variants land in phase 7:
 | `ci_health_check` | `GitHub-Hookshot/<sha>` | polls `/health`, `/healthz`, `/ping` |
 
 Each family lives in `generators/benign_bots/<family>.py` and ships in
-one shared image — the runner dispatches on `ALLM_BENIGN_BOT`. None of
+one shared image — the runner dispatches on `CERNIS_BENIGN_BOT`. None of
 them publish ports; the loopback invariant is unchanged.
 
 ### Label schema (additive, group key = `session_id`)
@@ -354,7 +354,7 @@ Every `requests.jsonl` row now carries:
 | `stealth` | bool |
 
 Existing `src_label` is preserved for back-compat with the phase-4
-detector. Legacy generators (phases 1-5) that only set `X-Allm-Source`
+detector. Legacy generators (phases 1-5) that only set `X-Cernis-Source`
 are mapped onto `(class, family)` by the capture proxy so eval code
 can group by the new axes without per-row guards.
 
@@ -374,7 +374,7 @@ Generators write provenance via `generators/shared/manifest.py`. The
 helper exposes `record_provenance_httpx()` (for the non-browser bots
 and the future framework / scanner generators) and
 `record_provenance_playwright()` (for browser-driven generators —
-shares the `allm_sid` cookie with the BrowserContext). Per-session
+shares the `cernis_sid` cookie with the BrowserContext). Per-session
 `ts_start`/`ts_end` are recovered at read time by joining
 `sessions.jsonl` against `requests.jsonl`.
 
@@ -433,7 +433,7 @@ against the existing model architecture.
 ### Extended attack generators
 
 All three use the existing `shared/manifest.py` provenance helper +
-`X-Allm-*` label headers; they don't draw any new exploit code — just
+`X-Cernis-*` label headers; they don't draw any new exploit code — just
 established tools pointed at the existing targets.
 
 | family | engine | distinctive HTTP signal | targets so far |
@@ -524,7 +524,7 @@ eval blocks degrade to whatever signal those labels carry.
 
 Phase 6 introduced the `stealth` manifest axis but no generator ever
 set it to `true`. Phase 9 exercises it: each existing agent gets a
-stealth-mode code path gated by `ALLM_STEALTH=true`. Family stays the
+stealth-mode code path gated by `CERNIS_STEALTH=true`. Family stays the
 same (per the spec); the `stealth` flag is the distinguishing axis.
 
 ### Stealth knobs per agent
@@ -544,7 +544,7 @@ organically. Stealth sqlmap doesn't read robots either (it never did).
 ### Compose
 
 Four new services under `profiles: ["stealth"]`, each reusing the
-matching non-stealth image with `ALLM_STEALTH=true`:
+matching non-stealth image with `CERNIS_STEALTH=true`:
 
 ```sh
 docker compose --profile stealth up -d --build       # 4 stealth twins
@@ -639,7 +639,7 @@ single sweep report on top of the merged data:
 | `default_config()` | returns a `SweepConfig` with sensible axis values: DVWA + Juice Shop + VAmPI; the 4 agent families; `low` + `medium` security; both stealth values. Trims combinations that don't make sense (Selenium/Puppeteer at VAmPI — no DOM; sqlmap-stealth × high security — yields nothing). Default ≈ 34 cells. |
 | `build_sweep_plan(config)` | pure-Python; returns `list[SweepCell]`. Testable without docker. |
 | `start_benign(config)` | brings up the 5 benign_bot services once; they run continuously underneath the sweep so the FP/hour denominator stays meaningful. |
-| `execute_sweep(plan)` | drives `docker compose run --rm` per cell with `ALLM_TARGET / ALLM_TARGET_APP / DVWA_SECURITY_LEVEL / ALLM_SESSIONS / ALLM_STEALTH` env. Cells continue after a failure — the eval already tolerates partial data. |
+| `execute_sweep(plan)` | drives `docker compose run --rm` per cell with `CERNIS_TARGET / CERNIS_TARGET_APP / DVWA_SECURITY_LEVEL / CERNIS_SESSIONS / CERNIS_STEALTH` env. Cells continue after a failure — the eval already tolerates partial data. |
 | `per_cell_census(plan, sessions_path)` | joins each planned cell to the actual `sessions.jsonl` provenance rows so the report shows which cells actually produced data. |
 | `build_sweep_report(data_dir, plan)` | runs `train.py + eval.py + heldout.py` as subprocesses, attaches the census, and returns one report dict that the CLI writes to `data/reports/sweep_<ts>.json`. |
 
@@ -684,12 +684,12 @@ remaining four under `profiles: ["attack-extended"]`.
 
 | family | engine | distinctive HTTP signal |
 |---|---|---|
-| `raw_httpx` | Python + httpx | tight per-request loops, no external tool — rotates SQLi / XSS / path-traversal / CMDi payloads through fixed endpoint list. Sets X-Allm-* natively. |
-| `ffuf` | Go binary (pinned 2.1.0, downloaded at build) | path fuzzer; uses `-H` to attach X-Allm-* to every probe; rate-bounded via `-rate` / `-t` (1 thread + rate 5 in stealth, 10 threads + rate 50 in fast). |
-| `scrapy` | Python Scrapy crawler | `LinkExtractor` walks the site + submits the first form on every page with a SQLi payload. `DEFAULT_REQUEST_HEADERS` attaches X-Allm-* framework-wide. |
+| `raw_httpx` | Python + httpx | tight per-request loops, no external tool — rotates SQLi / XSS / path-traversal / CMDi payloads through fixed endpoint list. Sets X-Cernis-* natively. |
+| `ffuf` | Go binary (pinned 2.1.0, downloaded at build) | path fuzzer; uses `-H` to attach X-Cernis-* to every probe; rate-bounded via `-rate` / `-t` (1 thread + rate 5 in stealth, 10 threads + rate 50 in fast). |
+| `scrapy` | Python Scrapy crawler | `LinkExtractor` walks the site + submits the first form on every page with a SQLi payload. `DEFAULT_REQUEST_HEADERS` attaches X-Cernis-* framework-wide. |
 | `nikto` | Perl (sullo/nikto pinned 2.5.0, cloned at build) | comprehensive web vuln scanner. Can't set per-request headers — uses the proxy schema cache (below) plus `-StaticCookies` for sid carriage. Stealth uses `-Tuning x6` + `-Pause 2`. |
 
-All four ship a single image per family; `ALLM_STEALTH=true` at run
+All four ship a single image per family; `CERNIS_STEALTH=true` at run
 time switches the bot into stealth mode. No separate stealth services
 (would be redundant — the same binary handles both modes).
 
@@ -704,9 +704,9 @@ _session_src_label_cache: dict[str, str]  # session_id -> src_label
 ```
 
 On every request:
-- If the request **carries X-Allm-* headers**, resolve the schema
+- If the request **carries X-Cernis-* headers**, resolve the schema
   fresh and `setdefault` it into the cache (first-write-wins per sid).
-- If the request **doesn't carry X-Allm-* headers** but the cache has
+- If the request **doesn't carry X-Cernis-* headers** but the cache has
   an entry for its sid, hydrate the log row's schema from the cache.
 
 So nikto's bootstrap → labeled httpx request mints the sid + populates
@@ -769,9 +769,9 @@ authorization bugs, mass assignment, business-logic abuse.
 | `crapi_postgresdb` | `postgres:14` | identity + workshop DB |
 | `crapi_rabbitmq` | `rabbitmq:3-management-alpine` | message broker |
 | `crapi_mailhog` | `mailhog/mailhog` | SMTP capture for password reset flows |
-| `capture_crapi` | `allm-capture` (reused phase 6 image) | sibling capture proxy fronting `crapi:8888` with `ALLM_TARGET_APP=crapi` |
+| `capture_crapi` | `cernis-capture` (reused phase 6 image) | sibling capture proxy fronting `crapi:8888` with `CERNIS_TARGET_APP=crapi` |
 
-All 9 services on `allm_lab`, none publish ports. crAPI is heavier
+All 9 services on `cernis_lab`, none publish ports. crAPI is heavier
 than the other targets so it sits behind its own `crapi` profile
 instead of `multitarget` — bring it up explicitly:
 
@@ -795,7 +795,7 @@ python3 tests/phase12_smoke.py   # structural, no docker, <1s
 ```
 
 Asserts: all 9 crAPI services are declared under `profiles:["crapi"]`
-on the `allm_lab` network with NO published ports; `target_guard`
+on the `cernis_lab` network with NO published ports; `target_guard`
 accepts `capture_crapi` and still rejects external hosts; the sweep
 plan produces crAPI cells across browser + non-browser families with
 both stealth values; `per_cell_census` joins planned crAPI cells to
@@ -859,12 +859,12 @@ were fed into a future training loop.
 ```sh
 # Backfill an existing log
 python3 -m ingest.access_log_shipper --log /var/log/nginx/access.log \
-    --out /opt/allm/data/requests.jsonl --once \
+    --out /opt/cernis/data/requests.jsonl --once \
     --target-app prod --family prod_traffic
 
 # Continuous tail (polls every 1s)
 python3 -m ingest.access_log_shipper --log /var/log/nginx/access.log \
-    --out /opt/allm/data/requests.jsonl --follow
+    --out /opt/cernis/data/requests.jsonl --follow
 ```
 
 See `ingest/README.md` for the full ops doc — what fields go missing

@@ -5,7 +5,7 @@ Default behavior (`python3 orchestrator/run_loop.py`):
   2. Shuffles the generators (`human_sim`, `playwright_bot`, `pentesterpro`)
      so cookies land in random order (a small adversarial step — the
      detector shouldn't lean on "agents always come first").
-  3. Runs each generator with `ALLM_SESSIONS=N` (default 6) inside the
+  3. Runs each generator with `CERNIS_SESSIONS=N` (default 6) inside the
      `generators` profile of docker compose.
   4. Trains both detector heads.
   5. Evaluates and writes phase4-style report.
@@ -83,7 +83,7 @@ def gen_round(generators: list[tuple[str, int]], seed: int) -> dict:
         rc = run(
             [
                 "docker", "compose", "--profile", "generators", "run", "--rm",
-                "-e", f"ALLM_SESSIONS={n}",
+                "-e", f"CERNIS_SESSIONS={n}",
                 svc,
             ]
         )

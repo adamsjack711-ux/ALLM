@@ -5,9 +5,9 @@
 // which gives the detector a third agent-family fingerprint to learn
 // from. Class = agent, family = puppeteer_bot.
 //
-// X-Allm-* labels travel on every request via page.setExtraHTTPHeaders.
+// X-Cernis-* labels travel on every request via page.setExtraHTTPHeaders.
 // Provenance is written via the in-page fetch (inherits cookies from
-// the browser jar, including the allm_sid the proxy mints on first nav).
+// the browser jar, including the cernis_sid the proxy mints on first nav).
 // Target-guard runs as a pre-exec sh step in the Dockerfile so this
 // process never starts against a non-loopback target.
 
@@ -15,14 +15,14 @@ import { createHash } from 'node:crypto';
 import puppeteer from 'puppeteer-core';
 
 const LABEL = 'puppeteer_bot';
-const TARGET = process.env.ALLM_TARGET || 'http://capture:8080';
-const TARGET_APP = (process.env.ALLM_TARGET_APP || 'dvwa').toLowerCase();
+const TARGET = process.env.CERNIS_TARGET || 'http://capture:8080';
+const TARGET_APP = (process.env.CERNIS_TARGET_APP || 'dvwa').toLowerCase();
 const SECURITY_LEVEL = process.env.DVWA_SECURITY_LEVEL || 'low';
-const SESSIONS = parseInt(process.env.ALLM_SESSIONS || '3', 10);
+const SESSIONS = parseInt(process.env.CERNIS_SESSIONS || '3', 10);
 const DVWA_USER = process.env.DVWA_USER || 'admin';
 const DVWA_PASS = process.env.DVWA_PASS || 'password';
 const STEALTH = ['1', 'true', 'yes'].includes(
-    (process.env.ALLM_STEALTH || 'false').toLowerCase()
+    (process.env.CERNIS_STEALTH || 'false').toLowerCase()
 );
 const STEALTH_UA = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
@@ -73,12 +73,12 @@ function buildPayload(klass, family, generator, version, config) {
 
 function labelHeaders(payload) {
     return {
-        'X-Allm-Source': payload.family,
-        'X-Allm-Class': payload.class,
-        'X-Allm-Family': payload.family,
-        'X-Allm-TargetApp': payload.target_app,
-        'X-Allm-SecurityLevel': payload.security_level,
-        'X-Allm-Stealth': payload.stealth ? 'true' : 'false',
+        'X-Cernis-Source': payload.family,
+        'X-Cernis-Class': payload.class,
+        'X-Cernis-Family': payload.family,
+        'X-Cernis-TargetApp': payload.target_app,
+        'X-Cernis-SecurityLevel': payload.security_level,
+        'X-Cernis-Stealth': payload.stealth ? 'true' : 'false',
     };
 }
 

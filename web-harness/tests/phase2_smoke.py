@@ -23,8 +23,8 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA = ROOT / "data" / "requests.jsonl"
 
-N_BOT = int(os.environ.get("ALLM_PHASE2_BOT", "3"))
-N_HUMAN = int(os.environ.get("ALLM_PHASE2_HUMAN", "3"))
+N_BOT = int(os.environ.get("CERNIS_PHASE2_BOT", "3"))
+N_HUMAN = int(os.environ.get("CERNIS_PHASE2_HUMAN", "3"))
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -48,7 +48,7 @@ def docker_run(service: str, sessions: int) -> int:
         [
             "docker", "compose", "--profile", "generators",
             "run", "--rm",
-            "-e", f"ALLM_SESSIONS={sessions}",
+            "-e", f"CERNIS_SESSIONS={sessions}",
             service,
         ]
     ).returncode
@@ -63,7 +63,7 @@ def read_rows() -> list[dict]:
 def assert_loopback_only() -> None:
     """Verify the guard refuses an external URL — sanity check, not behavior."""
     env = dict(os.environ)
-    env["ALLM_TARGET"] = "http://example.com"
+    env["CERNIS_TARGET"] = "http://example.com"
     cp = subprocess.run(
         [sys.executable, "generators/shared/target_guard.py"],
         cwd=ROOT, env=env, capture_output=True,

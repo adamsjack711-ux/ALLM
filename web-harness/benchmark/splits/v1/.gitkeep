@@ -1,0 +1,4 @@
+# Placeholder so the splits/v1/ directory survives `git clone`.
+# Run `python3 -m benchmark.build_splits --data web-harness/data` to
+# populate this directory with public_*.json + MANIFEST.json. The
+# private_*.json files land here too but are gitignored.

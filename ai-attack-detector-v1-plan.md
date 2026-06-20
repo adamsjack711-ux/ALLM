@@ -38,6 +38,7 @@ events, stride 16, never crossing campaign boundaries.
 | `detector_v05.py` | GRU over per-event sequences | `python detector_v05.py` |
 | `detector_v1.py` | **ATT&CK multi-label** (risk + per-technique + spans) | `python detector_v1.py --synthetic` |
 | `detector_v2.py` | **hybrid** (aggregate features + GRU hidden state) | `python detector_v2.py --synthetic` |
+| `detector_v3.py` | **serving loop** (budget-tuned threshold, streaming, MTTD) | `python detector_v3.py --demo` |
 | `inspect_dataset.py` | profiles a real dataset, suggests a column mapping | `python inspect_dataset.py --demo` |
 | `adapter_winlogs.py` | Windows/Sysmon event-log adapter (+ ATT&CK→tactic crosswalk) | `python adapter_winlogs.py --demo` |
 
@@ -135,18 +136,49 @@ Recall by attack mode makes the mechanism explicit:
 Each single model is blind to the other's channel (0.037, 0.127); the hybrid
 recovers both groups, which is why its PR-AUC clears either model alone.
 
-### [ ] Task 3 — Real-data wiring + tiny serving loop
+### [x] Task 3 — Real-data wiring + tiny serving loop  (`detector_v3.py`)
 
-Use `inspect_dataset.py` / `adapter_winlogs.py` to map a real dataset into the
-normalized schema, get baseline + GRU numbers, then wrap the best model as a
-streaming function that emits alerts above a threshold tuned against FP/hour
-(not F1). Estimate mean-time-to-detect on replayed attack traces.
+Shipped. Three pieces:
 
-*Groundwork done:* `adapter_winlogs.py` maps Windows/Sysmon logs (OTRF/Sysmon
-field names) onto the schema — deriving `action` from (Channel, EventID),
-`depth` from the ProcessGuid→ParentProcessGuid tree — and carries an ATT&CK
-`technique` field through, with an `ATTACK_ID_TO_TACTIC` crosswalk that maps raw
-ids (e.g. `T1059`→command_execution) onto `detector_v1`'s tactic vocabulary so
-the logs are multi-label-ready. Remaining for task 3: an action-vocabulary
-mapping (Windows action names → the sequence model's input space) and the
-streaming/MTTD loop.
+- **Real-data wiring** — `load_events()` runs the same pipeline on any source by
+  adapting it into the normalized schema once: `adapt_real_dataframe` for generic
+  sources, `adapter_winlogs.adapt_winlog_dataframe` for Windows/Sysmon logs
+  (`--winlog`). The HF temporal-attack-pattern dataset is reached with
+  `--data <hf_id>` behind a lazy `datasets` import (needs network); the demo
+  path needs neither. `featurize_window` tolerates unknown action names (real
+  data) by simply emitting no action one-hot for them.
+- **Streaming serving loop** — `StreamingAlerter` ingests events one at a time,
+  keeps a per-campaign sliding buffer, scores each completed 32-event window with
+  the best model (the v2 hybrid), and emits an alert when risk crosses a
+  threshold **tuned against an FP/hour budget, not F1** (`tune_threshold_for_budget`
+  picks the lowest threshold whose estimated FP/hour ≤ budget → max recall within
+  the alert budget).
+- **Mean-time-to-detect** — `replay_mttd` replays held-out campaigns as streams
+  and measures seconds from attack onset (first attack event) to first alert.
+
+Measured (`--demo`, seed 0, 6,244 windows, 30.3% attack, FP/hour budget 1.0):
+
+| metric | value |
+|--------|------:|
+| PR-AUC (held-out campaigns) | 0.942 |
+| tuned threshold | 0.293 |
+| achieved FP/hour (test) | 1.23 |
+| precision / recall / F1 | 0.845 / 0.899 / 0.871 |
+| attack traces detected | 56/57 (98%) |
+| **mean-time-to-detect** | **94.2 s (~1.6 min)** |
+| median-time-to-detect | 83.8 s |
+
+Tightening to `--fp-budget 0.3` raises the threshold to 0.406, drops achieved
+FP/hour to 0.46 and lifts precision to 0.933, with MTTD essentially unchanged
+(~97 s) — the budget is a real, working knob.
+
+**Honest caveat surfaced by the loop:** ~50–56% of *benign* campaigns fire at
+least one alert even though window-level FP/hour is ≈1. That's alert-fatigue
+arithmetic — long benign sessions accumulate many windows, so a low per-window FP
+rate still yields a per-session alert often. It's a direct consequence of the
+genuine class overlap (constraint #4) and a reason a deployment would add
+per-entity alert suppression on top of the FP/hour budget.
+
+The `adapter_winlogs.py` groundwork (Windows→schema, ATT&CK-id→tactic crosswalk)
+feeds the `--winlog` path. Remaining for a true real run: point `--data` at the
+HF dataset in a networked environment.

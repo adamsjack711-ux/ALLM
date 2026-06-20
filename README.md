@@ -16,6 +16,8 @@ pip install numpy pandas scikit-learn torch
 python detector_v0.py --synthetic     # aggregate baseline
 python detector_v05.py                # GRU over event sequences
 python detector_v1.py --synthetic     # ATT&CK multi-label (risk + per-technique + spans)
+python detector_v2.py --synthetic     # hybrid: aggregate features + GRU hidden state
+python detector_v3.py --demo          # serving loop: budget-tuned alerts + MTTD
 python inspect_dataset.py --demo      # dataset column-mapping helper
 python adapter_winlogs.py --demo      # Windows/Sysmon event-log adapter
 ```

@@ -185,6 +185,136 @@ services:
     networks: [allm_lab]
     profiles: ["benign"]
 
+  # ── phase 7: additional vulnerable targets + sibling captures ────────
+  # Each new target gets its own capture container fronting it; all share
+  # the same proxy image but with different UPSTREAM + ALLM_TARGET_APP.
+  # No new published host ports — only the original `capture:8090` is
+  # host-visible, and that one still goes to DVWA.
+
+  juiceshop:
+    image: bkimminich/juice-shop:latest
+    container_name: allm_juiceshop
+    networks: [allm_lab]
+    profiles: ["multitarget"]
+    restart: unless-stopped
+
+  capture_juiceshop:
+    build: ./capture
+    image: allm-capture:latest
+    container_name: allm_capture_juiceshop
+    environment:
+      UPSTREAM: http://juiceshop:3000
+      ALLM_TARGET_APP: juice_shop
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    depends_on:
+      - juiceshop
+    networks: [allm_lab]
+    profiles: ["multitarget"]
+    restart: unless-stopped
+
+  webgoat:
+    image: webgoat/webgoat:latest
+    container_name: allm_webgoat
+    networks: [allm_lab]
+    profiles: ["multitarget"]
+    restart: unless-stopped
+
+  capture_webgoat:
+    build: ./capture
+    image: allm-capture:latest
+    container_name: allm_capture_webgoat
+    environment:
+      UPSTREAM: http://webgoat:8080
+      ALLM_TARGET_APP: webgoat
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    depends_on:
+      - webgoat
+    networks: [allm_lab]
+    profiles: ["multitarget"]
+    restart: unless-stopped
+
+  vampi:
+    image: erev0s/vampi:latest
+    container_name: allm_vampi
+    networks: [allm_lab]
+    profiles: ["multitarget"]
+    restart: unless-stopped
+
+  capture_vampi:
+    build: ./capture
+    image: allm-capture:latest
+    container_name: allm_capture_vampi
+    environment:
+      UPSTREAM: http://vampi:5000
+      ALLM_TARGET_APP: vampi
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    depends_on:
+      - vampi
+    networks: [allm_lab]
+    profiles: ["multitarget"]
+    restart: unless-stopped
+
+  # ── phase 7: extended attack generators (class=agent, not in phase 5) ─
+  # sqlmap is non-browser (exercises the no-beacon path for VAmPI);
+  # selenium runs Chromium via chromedriver (different fingerprint than
+  # Playwright); puppeteer runs Chromium under a Node runtime.
+  # All under profiles:["attack-extended"] so existing 1..6 gates run
+  # without them.
+
+  sqlmap_bot:
+    build:
+      context: ./generators
+      dockerfile: sqlmap_bot/Dockerfile
+    container_name: allm_sqlmap_bot
+    environment:
+      ALLM_TARGET: ${SQLMAP_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${SQLMAP_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_SQLMAP:-2}
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
+  selenium_bot:
+    build:
+      context: ./generators
+      dockerfile: selenium_bot/Dockerfile
+    container_name: allm_selenium_bot
+    environment:
+      ALLM_TARGET: ${SELENIUM_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${SELENIUM_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_SELENIUM:-3}
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
+  puppeteer_bot:
+    build:
+      context: ./generators
+      dockerfile: puppeteer_bot/Dockerfile
+    container_name: allm_puppeteer_bot
+    environment:
+      ALLM_TARGET: ${PUPPETEER_TARGET:-http://capture:8080}
+      ALLM_TARGET_APP: ${PUPPETEER_TARGET_APP:-dvwa}
+      ALLM_SESSIONS: ${ALLM_SESSIONS_PUPPETEER:-3}
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["attack-extended"]
+
 networks:
   allm_lab:
     name: allm_lab

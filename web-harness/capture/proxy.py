@@ -33,6 +33,11 @@ from aiohttp import web
 import honeypots
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://dvwa:80").rstrip("/")
+# Each capture container fronts one target. ALLM_TARGET_APP is the
+# label that flows into the per-row `target_app` column when the
+# generator didn't set X-Allm-TargetApp itself (e.g. human_real
+# browsing, or legacy generators).
+TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa")
 DATA_DIR = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REQ_LOG = DATA_DIR / "requests.jsonl"
@@ -114,7 +119,7 @@ def _label_schema_from_request(request: web.Request, src_label: str) -> dict:
     return {
         "class": cls or "unknown",
         "family": fam or src_label,
-        "target_app": request.headers.get("X-Allm-TargetApp", "dvwa"),
+        "target_app": request.headers.get("X-Allm-TargetApp", TARGET_APP),
         "security_level": request.headers.get("X-Allm-SecurityLevel", "na"),
         "stealth": stealth_raw in ("1", "true", "yes"),
     }

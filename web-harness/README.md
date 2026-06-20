@@ -23,6 +23,7 @@ pointed at DVWA at security levels low → high.
 | 4 | Hybrid GRU+MLP detector + PR-AUC / FP-hour eval + StreamingAlerter | ✅ |
 | 5 | PentesterPro-flavored agent + orchestrator + held-out-attacker eval | ✅ |
 | 6 | benign_bot family + per-session provenance manifest + label-schema columns | ✅ |
+| 7 | Multi-target (Juice Shop / WebGoat / VAmPI) + sqlmap / Selenium / Puppeteer agents | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -31,9 +32,12 @@ pointed at DVWA at security levels low → high.
   network and never expose ports.
 - Each traffic generator imports `generators/shared/target_guard.py` and
   reads its target from `ALLM_TARGET` only. The guard rejects any host
-  whose name isn't in `{capture, 127.0.0.1, ::1, localhost}` — hard
+  whose name isn't in `{capture, capture_dvwa, capture_juiceshop,
+  capture_webgoat, capture_vampi, 127.0.0.1, ::1, localhost}` — hard
   process exit before any I/O. CLI overrides are deliberately not
-  supported.
+  supported. The Node-based `puppeteer_bot` runs the Python guard as a
+  pre-exec step in its container so the JS process never starts against
+  a non-loopback target either.
 - The capture proxy strips `Authorization`, `Cookie`, and `Set-Cookie`
   *values* from every log row before write. Only presence bits
   (`has_auth_header`, `has_cookie_header`) and the sorted header *name
@@ -67,6 +71,12 @@ python3 orchestrator/run_loop.py --sessions 6
 python3 tests/phase6_smoke.py
 # or run the benign profile by hand:
 docker compose --profile benign up -d --build
+
+# Phase 7: multi-target + extended attack generators
+python3 tests/phase7_smoke.py
+# or run the new targets + extended agents by hand:
+docker compose --profile multitarget up -d --build         # juice shop / webgoat / vampi + their captures
+docker compose --profile attack-extended up -d --build     # sqlmap / selenium / puppeteer
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -243,7 +253,10 @@ allm-web-harness/
 │   ├── playwright_bot/         # spray fuzzer: greedy form fill + robots recon
 │   ├── human_sim/              # slow typing + mouse jitter + dwell
 │   ├── pentesterpro/           # multi-step + hidden-DOM + mock LLM
-│   └── benign_bots/            # googlebot / uptime / rss / unfurl / ci (class=benign_bot)
+│   ├── benign_bots/            # googlebot / uptime / rss / unfurl / ci (class=benign_bot)
+│   ├── sqlmap_bot/             # python CLI, no browser (class=agent, family=sqlmap)
+│   ├── selenium_bot/           # Chromium via chromedriver (class=agent, family=selenium_bot)
+│   └── puppeteer_bot/          # Chromium via Node + CDP (class=agent, family=puppeteer_bot)
 ├── detector/
 │   ├── features.py             # JSONL → per-session seq + agg + hp
 │   ├── model.py                # GRU + MLP head, ablate_hp flag
@@ -333,13 +346,83 @@ shares the `allm_sid` cookie with the BrowserContext). Per-session
 ### What phase 6 explicitly does not do
 
 - New attack generators (Selenium, Puppeteer, sqlmap, nikto, ffuf,
-  Scrapy, real OpenAI / Gemini PentesterPro). These land in phase 7.
+  Scrapy, real OpenAI / Gemini PentesterPro). Phase 7 ships the first
+  three; nikto / ffuf / Scrapy / real-LLM agents land in phase 8.
 - Multi-target support (Juice Shop, WebGoat, VAmPI / crAPI). Phase 7.
-- Stealth variants. Phase 7. The `stealth=true` axis is already a
+- Stealth variants. Phase 8. The `stealth=true` axis is already a
   manifest field so existing rows don't need re-keying.
 - New detector eval (per-family recall, agent-vs-benign_bot confusion,
   held-out family). The label-schema columns are persisted; the
   detector-side rollup lands in phase 8.
+
+## Phase 7 — multi-target + extended attack generators
+
+Phase 6 widened the label schema (`class / family / target_app /
+security_level / stealth`). Phase 7 finally exercises the `target_app`
+axis: each new vulnerable app gets its own sibling capture proxy that
+fronts it, and three new agent families (`sqlmap`, `selenium_bot`,
+`puppeteer_bot`) join the existing `playwright_bot` and `pentesterpro`
+on `class=agent`.
+
+### Targets + captures
+
+| target_app | upstream | capture service | profile |
+|---|---|---|---|
+| `dvwa` (default) | `dvwa:80` | `capture` | base |
+| `juice_shop` | `juiceshop:3000` (bkimminich/juice-shop) | `capture_juiceshop` | `multitarget` |
+| `webgoat` | `webgoat:8080` (webgoat/webgoat) | `capture_webgoat` | `multitarget` |
+| `vampi` | `vampi:5000` (erev0s/vampi — vulnerable API, no DOM) | `capture_vampi` | `multitarget` |
+
+All four captures share `./data:/data` so `requests.jsonl`,
+`sessions.jsonl`, `beacons.jsonl`, and `honeypots.jsonl` remain
+single-stream — the `target_app` column on every row tells you which
+capture wrote it. JSONL appends from different processes are
+crash-safe (POSIX `O_APPEND` is atomic for the line sizes we write).
+
+Only the original `capture` still publishes `127.0.0.1:8090` for
+human-real DVWA browsing; the new captures publish nothing. Generators
+inside the docker network address them as `capture_juiceshop:8080` etc.
+The `ALLOWED_HOSTS` set in `target_guard.py` enforces this.
+
+### VAmPI = no DOM, no beacon
+
+VAmPI is a JSON API with no HTML — the proxy's beacon-inject pass
+(`should_inject` checks `text/html`) skips it, so beacon-derived
+features (`js_ran`, `ttfi`, `dom_read`) stay zero for VAmPI sessions.
+`detector/features.py` already handles this gracefully (zero-init
+when `by_sid_bcn[sid]` is empty), so the detector degrades to
+timing/sequence/path features without code changes. The phase 8 eval
+will be the first to verify VAmPI sessions actually train cleanly
+against the existing model architecture.
+
+### Extended attack generators
+
+All three use the existing `shared/manifest.py` provenance helper +
+`X-Allm-*` label headers; they don't draw any new exploit code — just
+established tools pointed at the existing targets.
+
+| family | engine | distinctive HTTP signal | targets so far |
+|---|---|---|---|
+| `sqlmap` | Python CLI, no browser | no beacon callback; high request rate against a single endpoint with structured payload mutations | DVWA SQLi, VAmPI debug |
+| `selenium_bot` | Chromium via chromedriver + W3C WebDriver | beacon fires, but request initiator + nav timing differs from CDP-driven Playwright | DVWA SQLi/XSS/exec |
+| `puppeteer_bot` | Chromium via Node + CDP | beacon fires, Node's HTTP stack on the host side (proxy sees it as the browser, but the runtime telemetry differs) | DVWA SQLi/XSS/exec |
+
+The phase 7 sweep deliberately mixes generator × target_app so the
+detector eval in phase 8 has sessions to slice by both axes.
+
+### What phase 7 explicitly does not do
+
+- nikto, ffuf, raw httpx / Scrapy generators. Phase 8.
+- Real OpenAI- / Gemini-backed PentesterPro (still mocked). Phase 8.
+- Stealth variants (timing jitter, simulated mouse, human-speed
+  throttle, honeypot-avoidant). Phase 8 — the `stealth=true` axis
+  is already a manifest field.
+- Detector eval that consumes the new `target_app` / `family` axes
+  (per-family recall, agent-vs-benign_bot confusion, held-out family).
+  Phase 8.
+- crAPI as a fourth target. VAmPI covers the no-DOM API case for
+  phase 7; crAPI is heavier (Docker Compose with several services)
+  and lands in phase 9 if needed.
 
 ## Out of scope
 

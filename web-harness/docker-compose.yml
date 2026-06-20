@@ -105,6 +105,86 @@ services:
       - ./data:/data
     profiles: ["analysis"]
 
+  # ── benign_bot family (negative class) ───────────────────────────────
+  # All five services share the same image; ALLM_BENIGN_BOT picks which
+  # family runs. They don't publish ports and only start under the
+  # `benign` profile, so existing phase-1..5 smoke tests are unaffected.
+
+  benign_googlebot:
+    build:
+      context: ./generators
+      dockerfile: benign_bots/Dockerfile
+    image: allm-benign-bots:latest
+    container_name: allm_benign_googlebot
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_BENIGN_BOT: googlebot
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["benign"]
+
+  benign_uptime:
+    image: allm-benign-bots:latest
+    build:
+      context: ./generators
+      dockerfile: benign_bots/Dockerfile
+    container_name: allm_benign_uptime
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_BENIGN_BOT: uptime
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["benign"]
+
+  benign_rss:
+    image: allm-benign-bots:latest
+    build:
+      context: ./generators
+      dockerfile: benign_bots/Dockerfile
+    container_name: allm_benign_rss
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_BENIGN_BOT: rss
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["benign"]
+
+  benign_unfurl:
+    image: allm-benign-bots:latest
+    build:
+      context: ./generators
+      dockerfile: benign_bots/Dockerfile
+    container_name: allm_benign_unfurl
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_BENIGN_BOT: unfurl
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["benign"]
+
+  benign_ci:
+    image: allm-benign-bots:latest
+    build:
+      context: ./generators
+      dockerfile: benign_bots/Dockerfile
+    container_name: allm_benign_ci
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_BENIGN_BOT: ci
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BENIGN:-3}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["benign"]
+
 networks:
   allm_lab:
     name: allm_lab

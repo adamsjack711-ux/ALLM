@@ -93,6 +93,15 @@ temporal-attack-pattern dataset, Windows/Sysmon logs via `adapter_winlogs.py`)
 is wired and code-exercised on demo loaders; running against a live dataset
 needs a networked environment.
 
+### Sibling labs
+
+- **`web-harness/`** — localhost-only purple-team lab that asks the
+  web-side of the same question (is this visitor an autonomous LLM
+  agent?). DVWA + capture proxy + GRU+MLP detector. Phase 6 added a
+  `benign_bot` family (Googlebot / uptime monitor / RSS reader /
+  link-unfurler / CI health-check) and a per-session provenance
+  manifest. See [`web-harness/README.md`](./web-harness/README.md).
+
 ## License
 
 [MIT](./LICENSE) © 2026 Jack Adams-Lovell

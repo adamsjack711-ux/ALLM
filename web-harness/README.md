@@ -22,6 +22,7 @@ pointed at DVWA at security levels low → high.
 | 3 | Honeypots (`/__canary`, hidden form, robots tarpit, hidden DOM hint) | ✅ |
 | 4 | Hybrid GRU+MLP detector + PR-AUC / FP-hour eval + StreamingAlerter | ✅ |
 | 5 | PentesterPro-flavored agent + orchestrator + held-out-attacker eval | ✅ |
+| 6 | benign_bot family + per-session provenance manifest + label-schema columns | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -61,6 +62,11 @@ python3 tests/phase4_smoke.py
 python3 tests/phase5_smoke.py
 # or directly:
 python3 orchestrator/run_loop.py --sessions 6
+
+# Phase 6: benign_bot family + provenance manifest
+python3 tests/phase6_smoke.py
+# or run the benign profile by hand:
+docker compose --profile benign up -d --build
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -233,9 +239,11 @@ allm-web-harness/
 │   ├── Dockerfile, requirements.txt
 ├── generators/
 │   ├── shared/target_guard.py  # loopback-only ALLM_TARGET enforcer
+│   ├── shared/manifest.py      # provenance helper (httpx + Playwright variants)
 │   ├── playwright_bot/         # spray fuzzer: greedy form fill + robots recon
 │   ├── human_sim/              # slow typing + mouse jitter + dwell
-│   └── pentesterpro/           # multi-step + hidden-DOM + mock LLM
+│   ├── pentesterpro/           # multi-step + hidden-DOM + mock LLM
+│   └── benign_bots/            # googlebot / uptime / rss / unfurl / ci (class=benign_bot)
 ├── detector/
 │   ├── features.py             # JSONL → per-session seq + agg + hp
 │   ├── model.py                # GRU + MLP head, ablate_hp flag
@@ -262,6 +270,76 @@ docker image inspect ghcr.io/digininja/dvwa:latest --format '{{index .RepoDigest
 
 Replace the `image:` line in `docker-compose.yml` with that `@sha256:…`
 form for reproducibility.
+
+## Phase 6 — benign_bot family + provenance manifest
+
+Phase 6 adds the **negative class** the detector needs to be measured
+against beyond `human_sim` / `human_real`: legitimate non-browser
+automation that looks superficially agent-like (high request rate,
+non-Chrome UA, no JS execution) but is not adversarial.
+
+Five families ship, all under `class=benign_bot`, all loopback-bound,
+all non-stealthy (`stealth=false`) — stealth variants land in phase 7:
+
+| family | UA | what it does |
+|---|---|---|
+| `googlebot` | `Googlebot/2.1` | reads `robots.txt`, walks `Disallow` paths, BFS from `/` |
+| `uptime_monitor` | `UptimeRobot/2.0` | `HEAD`+`GET /` on a fixed cadence |
+| `rss_reader` | `Feedfetcher-Google` | polls `/feed`, `/rss`, `/atom.xml` (mostly 404s — that's the point) |
+| `link_unfurler` | `Slackbot-LinkExpanding 1.0` | `HEAD`+`GET` then parses `og:` / `twitter:` meta |
+| `ci_health_check` | `GitHub-Hookshot/<sha>` | polls `/health`, `/healthz`, `/ping` |
+
+Each family lives in `generators/benign_bots/<family>.py` and ships in
+one shared image — the runner dispatches on `ALLM_BENIGN_BOT`. None of
+them publish ports; the loopback invariant is unchanged.
+
+### Label schema (additive, group key = `session_id`)
+
+Every `requests.jsonl` row now carries:
+
+| column | values |
+|---|---|
+| `class` | `agent` / `human` / `benign_bot` / `unknown` |
+| `family` | `playwright_bot`, `pentesterpro`, `human_sim`, `human_real`, `googlebot`, `uptime_monitor`, `rss_reader`, `link_unfurler`, `ci_health_check`, … |
+| `target_app` | `dvwa` for now (phase 7 adds Juice Shop / WebGoat / vulnerable API) |
+| `security_level` | `low` / `medium` / `high` / `na` |
+| `stealth` | bool |
+
+Existing `src_label` is preserved for back-compat with the phase-4
+detector. Legacy generators (phases 1-5) that only set `X-Allm-Source`
+are mapped onto `(class, family)` by the capture proxy so eval code
+can group by the new axes without per-row guards.
+
+### Provenance manifest
+
+One row per session in `data/sessions.jsonl`:
+
+```json
+{"ts": 1718000000.123, "session_id": "abc…", "src_label": "googlebot",
+ "class": "benign_bot", "family": "googlebot", "target_app": "dvwa",
+ "security_level": "na", "stealth": false,
+ "generator": "googlebot", "generator_version": "0.1.0",
+ "generator_config_sha": "ab12cd34", "extra": {}}
+```
+
+Generators write provenance via `generators/shared/manifest.py`. The
+helper exposes `record_provenance_httpx()` (for the non-browser bots
+and the future framework / scanner generators) and
+`record_provenance_playwright()` (for browser-driven generators —
+shares the `allm_sid` cookie with the BrowserContext). Per-session
+`ts_start`/`ts_end` are recovered at read time by joining
+`sessions.jsonl` against `requests.jsonl`.
+
+### What phase 6 explicitly does not do
+
+- New attack generators (Selenium, Puppeteer, sqlmap, nikto, ffuf,
+  Scrapy, real OpenAI / Gemini PentesterPro). These land in phase 7.
+- Multi-target support (Juice Shop, WebGoat, VAmPI / crAPI). Phase 7.
+- Stealth variants. Phase 7. The `stealth=true` axis is already a
+  manifest field so existing rows don't need re-keying.
+- New detector eval (per-family recall, agent-vs-benign_bot confusion,
+  held-out family). The label-schema columns are persisted; the
+  detector-side rollup lands in phase 8.
 
 ## Out of scope
 

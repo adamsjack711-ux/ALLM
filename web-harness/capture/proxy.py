@@ -37,13 +37,25 @@ DATA_DIR = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REQ_LOG = DATA_DIR / "requests.jsonl"
 BEACON_LOG = DATA_DIR / "beacons.jsonl"
+SESSIONS_LOG = DATA_DIR / "sessions.jsonl"
 BEACON_JS = pathlib.Path(__file__).with_name("beacon.js").read_bytes()
 
-TELEMETRY_PATHS = ("/__beacon.js", "/__beacon")
+TELEMETRY_PATHS = ("/__beacon.js", "/__beacon", "/__provenance")
+
+# Back-compat mapping: existing generators (phases 1-5) only set
+# X-Allm-Source. Derive class/family for them so eval code can group by
+# the new label-schema axes without per-row guards.
+_LEGACY_SRC_TO_LABEL: dict[str, tuple[str, str]] = {
+    "playwright_bot": ("agent", "playwright_bot"),
+    "pentesterpro": ("agent", "pentesterpro"),
+    "human_sim": ("human", "human_sim"),
+    "human_real": ("human", "human_real"),
+}
 
 _session_last_seen: dict[str, float] = {}
 _log_lock = asyncio.Lock()
 _beacon_lock = asyncio.Lock()
+_sessions_lock = asyncio.Lock()
 
 
 def safe_header_set(headers) -> str:
@@ -74,6 +86,38 @@ async def write_beacon_log(row: dict) -> None:
     async with _beacon_lock:
         with BEACON_LOG.open("a") as f:
             f.write(line)
+
+
+async def write_session_log(row: dict) -> None:
+    line = json.dumps(row, separators=(",", ":")) + "\n"
+    async with _sessions_lock:
+        with SESSIONS_LOG.open("a") as f:
+            f.write(line)
+
+
+def _label_schema_from_request(request: web.Request, src_label: str) -> dict:
+    """Pull the X-Allm-* label-schema headers off a request.
+
+    Falls back to deriving class/family from src_label for legacy
+    generators (phases 1-5) that only set X-Allm-Source. The fallback
+    target_app stays "dvwa" because phase 1 is DVWA-only; this constant
+    moves to a header lookup in phase 2 when multi-target lands.
+    """
+    cls = request.headers.get("X-Allm-Class")
+    fam = request.headers.get("X-Allm-Family")
+    if cls is None or fam is None:
+        derived = _LEGACY_SRC_TO_LABEL.get(src_label)
+        if derived is not None:
+            cls = cls or derived[0]
+            fam = fam or derived[1]
+    stealth_raw = request.headers.get("X-Allm-Stealth", "").lower()
+    return {
+        "class": cls or "unknown",
+        "family": fam or src_label,
+        "target_app": request.headers.get("X-Allm-TargetApp", "dvwa"),
+        "security_level": request.headers.get("X-Allm-SecurityLevel", "na"),
+        "stealth": stealth_raw in ("1", "true", "yes"),
+    }
 
 
 @web.middleware
@@ -113,6 +157,7 @@ async def session_and_log_middleware(request: web.Request, handler):
     ctype_full = resp.content_type or ""
     ctype = ctype_full.split(";", 1)[0].strip().lower()
 
+    schema = _label_schema_from_request(request, label)
     log_row = {
         "ts": started,
         "session_id": sid,
@@ -133,6 +178,11 @@ async def session_and_log_middleware(request: web.Request, handler):
         "has_cookie_header": any(k.lower() == "cookie" for k in request.headers),
         "content_type": ctype,
         "elapsed_ms": int((time.time() - started) * 1000),
+        "class": schema["class"],
+        "family": schema["family"],
+        "target_app": schema["target_app"],
+        "security_level": schema["security_level"],
+        "stealth": schema["stealth"],
     }
     await write_request_log(log_row)
     return resp
@@ -165,6 +215,45 @@ async def receive_beacon(request: web.Request) -> web.Response:
         "event": payload,
     }
     await write_beacon_log(row)
+    return web.Response(status=204)
+
+
+_PROVENANCE_STR_FIELDS = (
+    "class", "family", "target_app", "security_level",
+    "generator", "generator_version", "generator_config_sha",
+)
+
+
+async def record_provenance(request: web.Request) -> web.Response:
+    """Per-session provenance row.
+
+    Generators POST {family, class, target_app, security_level, stealth,
+    generator, generator_version, generator_config_sha, extra} after
+    their first request mints a session cookie. We write a single row to
+    sessions.jsonl keyed by the resolved session_id. Eval joins this
+    against requests.jsonl to recover ts_start / ts_end per session.
+    """
+    sid = request["_sid"]
+    label = request["_label"]
+    body_in = request["_body_in"]
+    try:
+        payload = json.loads(body_in.decode("utf-8", "replace"))
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "not_object"}, status=400)
+
+    row = {
+        "ts": time.time(),
+        "session_id": sid,
+        "src_label": label,
+        "stealth": bool(payload.get("stealth", False)),
+        "extra": payload.get("extra") or {},
+    }
+    for f in _PROVENANCE_STR_FIELDS:
+        v = payload.get(f)
+        row[f] = str(v) if v is not None else ""
+    await write_session_log(row)
     return web.Response(status=204)
 
 
@@ -274,6 +363,7 @@ def make_app(*, label: Optional[str], default_from_header: bool) -> web.Applicat
 
     app.router.add_get("/__beacon.js", serve_beacon_js)
     app.router.add_post("/__beacon", receive_beacon)
+    app.router.add_post("/__provenance", record_provenance)
     app.router.add_get("/robots.txt", honeypot_robots)
     app.router.add_route("*", "/__canary", honeypot_canary)
     app.router.add_route("*", "/__admin_secrets", honeypot_tarpit)

@@ -39,6 +39,7 @@ events, stride 16, never crossing campaign boundaries.
 | `detector_v1.py` | **ATT&CK multi-label** (risk + per-technique + spans) | `python detector_v1.py --synthetic` |
 | `detector_v2.py` | **hybrid** (aggregate features + GRU hidden state) | `python detector_v2.py --synthetic` |
 | `detector_v3.py` | **serving loop** (budget-tuned threshold, streaming, MTTD) | `python detector_v3.py --demo` |
+| `sweep.py` | multi-seed robustness sweep over v1/v2/v3 | `python sweep.py` |
 | `inspect_dataset.py` | profiles a real dataset, suggests a column mapping | `python inspect_dataset.py --demo` |
 | `adapter_winlogs.py` | Windows/Sysmon event-log adapter (+ ATT&CK→tactic crosswalk) | `python adapter_winlogs.py --demo` |
 
@@ -181,4 +182,32 @@ per-entity alert suppression on top of the FP/hour budget.
 
 The `adapter_winlogs.py` groundwork (Windows→schema, ATT&CK-id→tactic crosswalk)
 feeds the `--winlog` path. Remaining for a true real run: point `--data` at the
-HF dataset in a networked environment.
+HF dataset in a networked environment (the offline dev box used here blocks
+huggingface.co with HTTP 403, so the real-data path is wired and code-exercised
+on the demo loaders but not yet run against the live dataset).
+
+## Robustness (`sweep.py`)
+
+Single-seed numbers can flatter a model. `sweep.py` re-runs v1/v2/v3 across
+seeds 0–2 (epochs 40) and reports mean ± std. The headline claims hold every
+seed — they are not seed luck:
+
+| detector | metric | mean ± std | min–max |
+|----------|--------|-----------:|---------|
+| v1 | v0 aggregate PR-AUC | 0.705 ± 0.015 | 0.694–0.726 |
+| v1 | **v1 risk PR-AUC** | **0.782 ± 0.012** | 0.766–0.792 |
+| v1 | per-technique macro recall | 0.550 ± 0.009 | 0.538–0.560 |
+| v2 | aggregate-only PR-AUC | 0.771 ± 0.033 | 0.738–0.817 |
+| v2 | GRU-only PR-AUC | 0.723 ± 0.014 | 0.707–0.741 |
+| v2 | **hybrid PR-AUC** | **0.927 ± 0.012** | 0.913–0.942 |
+| v2 | lift over best single | 0.155 ± 0.032 | 0.110–0.183 |
+| v3 | serving PR-AUC | 0.927 ± 0.012 | 0.913–0.942 |
+| v3 | achieved FP/hour (test) | 1.46 ± 0.22 | 1.23–1.76 |
+| v3 | detection rate | 96% ± 1.6 | 94–98% |
+| v3 | **mean-time-to-detect** | **101.8 s ± 5.5** | 94.2–107.0 s |
+
+- task 1: v1 risk PR-AUC ≥ v0 aggregate in **3/3** seeds.
+- task 2: hybrid beats the best single model in **3/3** seeds (mean lift +0.155).
+
+(The per-task tables above quote the seed-0 run; every figure sits inside the
+seed 0–2 range here.)

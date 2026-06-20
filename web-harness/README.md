@@ -29,6 +29,7 @@ pointed at DVWA at security levels low → high.
 | 10 | Held-out-stealth eval + orchestrator sweep `{target}×{family}×{security_level}×{stealth}` | ✅ |
 | 11 | Scanner family (nikto / ffuf / raw_httpx / scrapy) + proxy session-schema cache | ✅ |
 | 12 | crAPI as fourth target (OWASP API security demo, 7 backing services) | ✅ |
+| 13 | Production access-log shipper (`ingest/`) — passive nginx/Apache log → requests.jsonl | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -105,6 +106,12 @@ docker compose --profile attack-extended up -d --build raw_httpx_bot ffuf_bot sc
 python3 tests/phase12_smoke.py                             # structural, no docker, <1s
 # crAPI is heavy (7 backing services) — under its own profile:
 docker compose --profile crapi up -d --build
+
+# Phase 13: production access-log shipper (safe in front of prod)
+python3 tests/phase13_smoke.py                             # synth-fed, no docker, <1s
+# Or ship a real log (backfill / follow modes):
+python3 -m ingest.access_log_shipper --log /var/log/nginx/access.log --once
+python3 -m ingest.access_log_shipper --log /var/log/nginx/access.log --follow
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -797,19 +804,103 @@ provenance rows correctly.
 ### What phase 12 explicitly does not do
 
 - Pull labels / forms / specific endpoints from the crAPI source.
-  The browser generators land on whatever the React SPA links to;
-  the non-browser scanners probe a fixed list of generic API paths
-  (`/api/users`, `/search`, etc.) that may or may not exist on crAPI.
-  Real crAPI-specific attack scripts (token replay against the
-  identity service, BOLA against `/identity/api/v2/user/dashboard`,
-  etc.) are out of scope — the original spec was about
-  detection-side, not attack-side fidelity.
-- Bring crAPI under the `multitarget` profile. Too heavy — it gets
-  its own opt-in profile.
-- Run the actual crAPI containers in the in-sandbox smoke. The
-  structural check covers what we can verify without docker; the
-  real test is `docker compose --profile crapi up -d --build` on
-  your machine.
+- Bring crAPI under the `multitarget` profile. Too heavy — opt-in.
+- Run the actual crAPI containers in the in-sandbox smoke.
+
+## Phase 13 — production access-log shipper
+
+Phases 1–12 are a closed-loop lab: synthetic generators drive traffic
+through a reverse-proxy that injects honeypots + a JS beacon, the
+detector trains on the resulting labeled JSONL. Phase 13 is the
+**production-safe counterpart**: a passive shipper that reads a real
+webserver's access logs and writes the same `requests.jsonl` schema,
+so a lab-trained model can score live traffic without further
+plumbing.
+
+### What it does NOT do (load-bearing for "safe in front of prod")
+
+- **NO** reverse-proxy injection — sits outside the request path.
+- **NO** honeypot injection — those are a lab artifact.
+- **NO** JS beacon injection — never modifies response bodies.
+- **NO** cookie minting — real users keep their session cookies, untouched.
+- **NO** request-body or sensitive-header capture — reads the access log only.
+
+### What it does
+
+`ingest/access_log_shipper.py` parses standard nginx / Apache
+**combined** log format:
+
+```
+$remote_addr - $remote_user [$time_local] "$request" $status
+$body_bytes_sent "$http_referer" "$http_user_agent"
+```
+
+For each line it emits one `requests.jsonl` row keyed on a synthesized
+`session_id`. The stitcher keys on `(src_ip, sha1(ua)[:8])` with a
+**30-minute inactivity timeout** — when a tuple goes quiet for >30
+min, the next request mints a fresh session.
+
+Fields the access log can't give us (`req_bytes`, `header_count`,
+`content_type`, `has_auth_header`, `has_cookie_header`, `elapsed_ms`)
+get safe defaults (`0`, `""`, `False`) that the detector's existing
+feature pipeline already tolerates. The **ML-only head** (`ml_only.pt`,
+which trains without honeypot inputs anyway) is the right consumer
+for prod data — `with_hp.pt` was tuned for sessions that have
+honeypot signal which prod traffic obviously won't.
+
+By default the shipper tags rows with `class=unknown`,
+`family=prod_traffic`, `target_app=prod`. **Never set `--klass agent`
+without ground truth** — the eval rollup treats `class=agent` as
+positive and a labeling mistake would silently mis-train if the JSONL
+were fed into a future training loop.
+
+### Two modes
+
+```sh
+# Backfill an existing log
+python3 -m ingest.access_log_shipper --log /var/log/nginx/access.log \
+    --out /opt/allm/data/requests.jsonl --once \
+    --target-app prod --family prod_traffic
+
+# Continuous tail (polls every 1s)
+python3 -m ingest.access_log_shipper --log /var/log/nginx/access.log \
+    --out /opt/allm/data/requests.jsonl --follow
+```
+
+See `ingest/README.md` for the full ops doc — what fields go missing
+vs the lab, when to use vs not, how to point a trained detector at
+the streaming output.
+
+### Smoke
+
+```sh
+python3 tests/phase13_smoke.py   # synth-fed, no docker, <1s
+```
+
+Synthesizes a tiny nginx-style log with two IPs, multiple UAs, a 35-
+minute gap to force a session rotation, and a garbage line that
+should be skipped. Asserts: `parse_line` extracts the right fields;
+`SessionStitcher` mints on gap and reuses within window; shipped rows
+carry `class=unknown` / `family=prod_traffic` / `target_app=prod` /
+`stealth=false` / `has_auth_header=false` / `has_cookie_header=false`
+(no lab artifacts, no sensitive-info leakage); the shipper creates
+**no** beacon / honeypot / sessions files; `features.build_sessions`
+consumes the output cleanly and resolves the schema correctly with
+all sessions `y=0`.
+
+### What phase 13 explicitly does not do
+
+- Streaming inference loop. The shipper produces JSONL; the existing
+  `detector/alerter.py` (or a custom wrapper around it) is what
+  scores in real time. Wiring those together is a deployment
+  concern, deliberately separate from the data-collection layer.
+- Custom log formats (LB-prefixed, JSON-shaped, etc.). The regex
+  lives at the top of `access_log_shipper.py` for anyone who needs
+  to extend.
+- Decompression of rotated logs. Live logs only. Pipe `zcat
+  access.log.1.gz | …` in front for backfill from rotations.
+- Producing training data. Production traffic is unlabeled; the
+  shipper is for inference inputs, not training inputs.
 
 ## Out of scope
 

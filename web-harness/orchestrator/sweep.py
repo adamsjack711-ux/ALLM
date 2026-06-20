@@ -98,6 +98,16 @@ _TARGETS: dict[str, dict] = {
         "url": "http://capture_vampi:8080",
         "families": {"sqlmap", "raw_httpx", "ffuf"},
     },
+    # phase 12: crAPI has a React SPA frontend + a JSON API surface, so
+    # browser-driven families ARE useful (they exercise the SPA + the
+    # XHR-to-API path), and the non-browser scanners hit the API directly.
+    # No DVWA-style server-rendered SQLi forms — sqlmap mostly probes
+    # query params on the API endpoints.
+    "crapi": {
+        "url": "http://capture_crapi:8080",
+        "families": {"playwright_bot", "sqlmap", "selenium_bot",
+                     "puppeteer_bot", "raw_httpx", "ffuf", "scrapy", "nikto"},
+    },
 }
 
 _FAMILY_SERVICES: dict[tuple[str, bool], str] = {

@@ -244,6 +244,9 @@ services:
     profiles: ["multitarget"]
     restart: unless-stopped
 
+  # phase 12: crAPI lives behind its own compose profile because it's
+  # ~7 backing services. See `profiles: ["crapi"]` block below.
+
   capture_vampi:
     build: ./capture
     image: allm-capture:latest
@@ -450,6 +453,153 @@ services:
       - capture
     networks: [allm_lab]
     profiles: ["attack-extended"]
+
+  # ── phase 12: crAPI fourth target (OWASP API security demo) ──────────
+  # crAPI is a 4-microservice OWASP API security playground (web /
+  # identity / community / workshop) backed by mongo + postgres + a
+  # rabbitmq + mailhog. The capture proxy fronts `crapi-web` (the user-
+  # facing gateway on :8888) which reverse-proxies internally to the
+  # microservices, so a single capture container sees the whole API
+  # surface. All under `profiles: ["crapi"]` so the (heavy) backing
+  # services don't auto-start. None of crAPI's services publish ports —
+  # capture_crapi inherits the loopback-only invariant.
+  #
+  # crAPI is heavier than VAmPI (~7 backing services vs 1) so this is
+  # a separate profile rather than rolling into "multitarget". Bring
+  # it up with:  docker compose --profile crapi up -d --build
+
+  crapi_mongodb:
+    image: mongo:6
+    container_name: allm_crapi_mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: crapi
+      MONGO_INITDB_ROOT_PASSWORD: crapi
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi_postgresdb:
+    image: postgres:14
+    container_name: allm_crapi_postgresdb
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: crapisecretpassword
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi_mailhog:
+    image: mailhog/mailhog:latest
+    container_name: allm_crapi_mailhog
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi_rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: allm_crapi_rabbitmq
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi_identity:
+    image: crapi/crapi-identity:latest
+    container_name: allm_crapi_identity
+    environment:
+      DB_NAME: crapi
+      DB_USER: admin
+      DB_PASSWORD: crapisecretpassword
+      DB_HOST: crapi_postgresdb
+      DB_PORT: 5432
+      SMTP_HOST: crapi_mailhog
+      SMTP_PORT: 1025
+    depends_on:
+      - crapi_postgresdb
+      - crapi_mailhog
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi_community:
+    image: crapi/crapi-community:latest
+    container_name: allm_crapi_community
+    environment:
+      MONGO_DB_HOST: crapi_mongodb
+      MONGO_DB_PORT: 27017
+      MONGO_DB_USER: crapi
+      MONGO_DB_PASSWORD: crapi
+      MONGO_DB_NAME: crapi
+      IDENTITY_SERVICE_HOST: crapi_identity
+      IDENTITY_SERVICE_PORT: 8080
+    depends_on:
+      - crapi_mongodb
+      - crapi_identity
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi_workshop:
+    image: crapi/crapi-workshop:latest
+    container_name: allm_crapi_workshop
+    environment:
+      DB_NAME: crapi
+      DB_USER: admin
+      DB_PASSWORD: crapisecretpassword
+      DB_HOST: crapi_postgresdb
+      DB_PORT: 5432
+      MONGO_DB_HOST: crapi_mongodb
+      MONGO_DB_PORT: 27017
+      MONGO_DB_USER: crapi
+      MONGO_DB_PASSWORD: crapi
+      MONGO_DB_NAME: crapi
+      IDENTITY_SERVICE_HOST: crapi_identity
+      IDENTITY_SERVICE_PORT: 8080
+      RABBITMQ_HOST: crapi_rabbitmq
+    depends_on:
+      - crapi_mongodb
+      - crapi_postgresdb
+      - crapi_identity
+      - crapi_rabbitmq
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  crapi:
+    # The user-facing gateway. Reverse-proxies internally to identity /
+    # community / workshop so capture_crapi sees the full API surface
+    # from one upstream.
+    image: crapi/crapi-web:latest
+    container_name: allm_crapi
+    environment:
+      IDENTITY_SERVICE_HOST: crapi_identity
+      IDENTITY_SERVICE_PORT: 8080
+      COMMUNITY_SERVICE_HOST: crapi_community
+      COMMUNITY_SERVICE_PORT: 8087
+      WORKSHOP_SERVICE_HOST: crapi_workshop
+      WORKSHOP_SERVICE_PORT: 8000
+    depends_on:
+      - crapi_identity
+      - crapi_community
+      - crapi_workshop
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
+
+  capture_crapi:
+    build: ./capture
+    image: allm-capture:latest
+    container_name: allm_capture_crapi
+    environment:
+      UPSTREAM: http://crapi:8888
+      ALLM_TARGET_APP: crapi
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    depends_on:
+      - crapi
+    networks: [allm_lab]
+    profiles: ["crapi"]
+    restart: unless-stopped
 
 networks:
   allm_lab:

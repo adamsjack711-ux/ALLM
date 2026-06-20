@@ -28,6 +28,7 @@ pointed at DVWA at security levels low → high.
 | 9 | Stealth twins of every agent + per-stealth / per-(family, stealth) eval cells | ✅ |
 | 10 | Held-out-stealth eval + orchestrator sweep `{target}×{family}×{security_level}×{stealth}` | ✅ |
 | 11 | Scanner family (nikto / ffuf / raw_httpx / scrapy) + proxy session-schema cache | ✅ |
+| 12 | crAPI as fourth target (OWASP API security demo, 7 backing services) | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -99,6 +100,11 @@ python3 orchestrator/sweep.py --sessions 2                 # 70 cells (post-phas
 python3 tests/phase11_smoke.py                             # synth-fed, no docker, ~8s
 # or build + run the new generators by hand:
 docker compose --profile attack-extended up -d --build raw_httpx_bot ffuf_bot scrapy_bot nikto_bot
+
+# Phase 12: crAPI fourth target
+python3 tests/phase12_smoke.py                             # structural, no docker, <1s
+# crAPI is heavy (7 backing services) — under its own profile:
+docker compose --profile crapi up -d --build
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -730,11 +736,80 @@ as `kind=agent`. No "accuracy" leak.
 
 ### What phase 11 explicitly does not do
 
-- Real OpenAI / Gemini PentesterPro (still mocked). Phase 12+.
-- crAPI as a fourth target. Phase 12+.
-- A production-side passive ingest (read real webserver access logs
-  → `requests.jsonl` schema for runtime detection on prod traffic).
-  Phase 13 candidate.
+- Real OpenAI / Gemini PentesterPro (still mocked). Phase 13+.
+- ~~crAPI as a fourth target.~~ **Phase 12 ships this.**
+- A production-side passive ingest. Phase 13 candidate.
+
+## Phase 12 — crAPI fourth target
+
+crAPI (OWASP's vulnerable API security playground) joins DVWA + Juice
+Shop + WebGoat + VAmPI as the fourth bundled target. Unlike VAmPI
+(which is a single Flask app), crAPI is a 4-microservice React-SPA-
+fronted application with its own dependency stack — 7 backing
+services total. Big surface area for a single target, but it brings
+realistic API-side attack patterns: JWT / OAuth misuse, BOLA-style
+authorization bugs, mass assignment, business-logic abuse.
+
+### Compose layout (under `profiles: ["crapi"]`)
+
+| service | image | role |
+|---|---|---|
+| `crapi` | `crapi/crapi-web` | user-facing gateway (port 8888, internally reverse-proxies to the 3 backends) |
+| `crapi_identity` | `crapi/crapi-identity` | auth / JWT / OAuth |
+| `crapi_community` | `crapi/crapi-community` | forum / posts microservice |
+| `crapi_workshop` | `crapi/crapi-workshop` | vehicle workshop business logic |
+| `crapi_mongodb` | `mongo:6` | community service DB |
+| `crapi_postgresdb` | `postgres:14` | identity + workshop DB |
+| `crapi_rabbitmq` | `rabbitmq:3-management-alpine` | message broker |
+| `crapi_mailhog` | `mailhog/mailhog` | SMTP capture for password reset flows |
+| `capture_crapi` | `allm-capture` (reused phase 6 image) | sibling capture proxy fronting `crapi:8888` with `ALLM_TARGET_APP=crapi` |
+
+All 9 services on `allm_lab`, none publish ports. crAPI is heavier
+than the other targets so it sits behind its own `crapi` profile
+instead of `multitarget` — bring it up explicitly:
+
+```sh
+docker compose --profile crapi up -d --build
+```
+
+### Sweep matrix grew 70 → 102
+
+`orchestrator/sweep.py` `_TARGETS` gains a `crapi` entry that allows
+**both browser and non-browser families** (unlike VAmPI which is
+non-browser-only). crAPI has a React SPA frontend that the browser
+families can crawl (exercising the XHR-to-API path) and a JSON API
+that sqlmap / raw_httpx / ffuf can probe directly. 32 of the 102
+default cells now exercise crAPI.
+
+### Smoke
+
+```sh
+python3 tests/phase12_smoke.py   # structural, no docker, <1s
+```
+
+Asserts: all 9 crAPI services are declared under `profiles:["crapi"]`
+on the `allm_lab` network with NO published ports; `target_guard`
+accepts `capture_crapi` and still rejects external hosts; the sweep
+plan produces crAPI cells across browser + non-browser families with
+both stealth values; `per_cell_census` joins planned crAPI cells to
+provenance rows correctly.
+
+### What phase 12 explicitly does not do
+
+- Pull labels / forms / specific endpoints from the crAPI source.
+  The browser generators land on whatever the React SPA links to;
+  the non-browser scanners probe a fixed list of generic API paths
+  (`/api/users`, `/search`, etc.) that may or may not exist on crAPI.
+  Real crAPI-specific attack scripts (token replay against the
+  identity service, BOLA against `/identity/api/v2/user/dashboard`,
+  etc.) are out of scope — the original spec was about
+  detection-side, not attack-side fidelity.
+- Bring crAPI under the `multitarget` profile. Too heavy — it gets
+  its own opt-in profile.
+- Run the actual crAPI containers in the in-sandbox smoke. The
+  structural check covers what we can verify without docker; the
+  real test is `docker compose --profile crapi up -d --build` on
+  your machine.
 
 ## Out of scope
 

@@ -7,7 +7,7 @@ a loopback name (127.0.0.1 / ::1 / localhost). Any non-http(s) scheme or
 unlisted host hard-exits the process before any network I/O happens.
 
 The detector lab is intentionally pointed at bundled deliberately-vulnerable
-targets (DVWA, Juice Shop, WebGoat, VAmPI) only; externally-supplied
+targets (DVWA, Juice Shop, WebGoat, VAmPI, crAPI) only; externally-supplied
 targets must be rejected in code, not just by docs.
 """
 
@@ -22,6 +22,8 @@ ALLOWED_HOSTS = frozenset({
     "capture",
     # phase 7: per-target captures — each fronts one intentionally-vulnerable app
     "capture_dvwa", "capture_juiceshop", "capture_webgoat", "capture_vampi",
+    # phase 12: crAPI (OWASP API security demo; multi-microservice)
+    "capture_crapi",
     # loopback aliases for host-side scripts
     "127.0.0.1", "::1", "localhost",
 })

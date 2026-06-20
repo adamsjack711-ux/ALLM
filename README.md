@@ -97,10 +97,18 @@ needs a networked environment.
 
 - **`web-harness/`** — localhost-only purple-team lab that asks the
   web-side of the same question (is this visitor an autonomous LLM
-  agent?). DVWA + capture proxy + GRU+MLP detector. Phase 6 added a
-  `benign_bot` family (Googlebot / uptime monitor / RSS reader /
-  link-unfurler / CI health-check) and a per-session provenance
-  manifest. See [`web-harness/README.md`](./web-harness/README.md).
+  agent?). DVWA + capture proxy + GRU+MLP detector. Phases 6–9 added
+  a `benign_bot` family, multi-target captures (Juice Shop / WebGoat /
+  VAmPI), three new agent families (sqlmap / Selenium / Puppeteer),
+  per-family / per-target_app / agent-vs-benign_bot eval rollups, and
+  stealth twins of every agent. See [`web-harness/README.md`](./web-harness/README.md).
+- **`pipeline/`** — host telemetry ingest path. Sysmon dump + CALDERA
+  op report (or Atomic Red Team invocations log) → labeled normalized
+  events → 32-event windows → detector. Phase 1 ships ingest +
+  per-campaign provenance; phase 2 adds Atomic Red Team as the
+  held-out emulation family, normal-workload + hard-negative
+  generators (5 subtypes), and a train-CALDERA-eval-Atomic-and-reverse
+  held-out emulation eval. See [`pipeline/README.md`](./pipeline/README.md).
 
 ## License
 

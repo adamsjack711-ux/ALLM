@@ -1,4 +1,4 @@
-# Aardvark— AI-Attack Detector
+# — AI-Attack Detector
 
 ALLM is a tool that helps spot computer attacks run by an AI. It reads
 security logs and tries to tell when an AI agent — not a person — is doing

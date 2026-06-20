@@ -14,6 +14,20 @@ For each request the middleware:
     which have their own log).
 
 No body content is written; sensitive headers are dropped before write.
+
+phase-bench-1 (human-real channel): the :8090 listener is the only
+ingress for real consented human browsing. A consent_gate middleware
+runs in front of session_and_log_middleware on that listener:
+  - GET  /__consent          → serve the consent landing page
+  - POST /__consent/accept   → mint consent_id + sid, write one row each
+                                to data/consent.jsonl and sessions.jsonl,
+                                set httponly cookies, 302 to upstream root
+  - every other path: 403 with link to /__consent until cernis_consent
+    cookie is present.
+
+Rows captured on the human channel drop the source IP entirely and
+replace the raw User-Agent with a coarse browser-family + device-type
+bucket — derived once and discarded. See capture/redaction.py.
 """
 
 from __future__ import annotations
@@ -31,6 +45,7 @@ import aiohttp
 from aiohttp import web
 
 import honeypots
+from redaction import redact_ip, ua_bucket
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://dvwa:80").rstrip("/")
 # Each capture container fronts one target. CERNIS_TARGET_APP is the
@@ -38,14 +53,24 @@ UPSTREAM = os.environ.get("UPSTREAM", "http://dvwa:80").rstrip("/")
 # generator didn't set X-Cernis-TargetApp itself (e.g. human_real
 # browsing, or legacy generators).
 TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa")
+SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
 DATA_DIR = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REQ_LOG = DATA_DIR / "requests.jsonl"
 BEACON_LOG = DATA_DIR / "beacons.jsonl"
 SESSIONS_LOG = DATA_DIR / "sessions.jsonl"
+CONSENT_LOG = DATA_DIR / "consent.jsonl"
 BEACON_JS = pathlib.Path(__file__).with_name("beacon.js").read_bytes()
+CONSENT_HTML = pathlib.Path(__file__).with_name("consent.html").read_bytes()
 
-TELEMETRY_PATHS = ("/__beacon.js", "/__beacon", "/__provenance")
+# Bumped whenever consent.html's terms change so consent rows can be
+# joined back to the exact wording the user agreed to.
+CONSENT_TEXT_VERSION = "v1"
+
+TELEMETRY_PATHS = (
+    "/__beacon.js", "/__beacon", "/__provenance",
+    "/__consent", "/__consent/accept",
+)
 
 # Back-compat mapping: existing generators (phases 1-5) only set
 # X-Cernis-Source. Derive class/family for them so eval code can group by
@@ -69,6 +94,7 @@ _session_src_label_cache: dict[str, str] = {}
 _log_lock = asyncio.Lock()
 _beacon_lock = asyncio.Lock()
 _sessions_lock = asyncio.Lock()
+_consent_lock = asyncio.Lock()
 
 
 def safe_header_set(headers) -> str:
@@ -105,6 +131,13 @@ async def write_session_log(row: dict) -> None:
     line = json.dumps(row, separators=(",", ":")) + "\n"
     async with _sessions_lock:
         with SESSIONS_LOG.open("a") as f:
+            f.write(line)
+
+
+async def write_consent_log(row: dict) -> None:
+    line = json.dumps(row, separators=(",", ":")) + "\n"
+    async with _consent_lock:
+        with CONSENT_LOG.open("a") as f:
             f.write(line)
 
 
@@ -200,10 +233,23 @@ async def session_and_log_middleware(request: web.Request, handler):
     else:
         cached_schema = _session_schema_cache.get(sid)
         schema = cached_schema or _label_schema_from_request(request, label)
+    # phase-bench-1: anonymize the human channel at write time. Raw IP
+    # is dropped; raw UA is replaced with a coarse browser+device bucket
+    # (the only UA-derived signal the detector needs). Other channels
+    # are unchanged — they only carry generator traffic between
+    # containers.
+    raw_ua = request.headers.get("User-Agent", "")[:300]
+    if request.app.get("is_human_channel"):
+        src_ip_val: Optional[str] = redact_ip(request.remote)
+        ua_val = ua_bucket(raw_ua)
+    else:
+        src_ip_val = request.remote
+        ua_val = raw_ua
+
     log_row = {
         "ts": started,
         "session_id": sid,
-        "src_ip": request.remote,
+        "src_ip": src_ip_val,
         "src_label": label,
         "method": request.method,
         "path": request.path,
@@ -211,7 +257,7 @@ async def session_and_log_middleware(request: web.Request, handler):
         "status": resp.status,
         "req_bytes": len(body_in),
         "resp_bytes": resp_len,
-        "ua": request.headers.get("User-Agent", "")[:300],
+        "ua": ua_val,
         "header_hash": safe_header_set(request.headers),
         "header_count": len(request.headers),
         "delta_ms": delta_ms,
@@ -299,6 +345,126 @@ async def record_provenance(request: web.Request) -> web.Response:
     return web.Response(status=204)
 
 
+# ── phase-bench-1: consent gate (human-real channel only) ───────────
+
+_BLOCKED_BODY = (
+    b"<!doctype html><html><body style='font-family:sans-serif;max-width:560px;"
+    b"margin:4em auto;padding:0 1em'>"
+    b"<h1>Consent required</h1>"
+    b"<p>This lab listener only records consented sessions. "
+    b"Visit <a href=\"/__consent\">/__consent</a> to read the terms and opt in.</p>"
+    b"</body></html>"
+)
+
+
+async def serve_consent(request: web.Request) -> web.Response:
+    return web.Response(
+        body=CONSENT_HTML,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def accept_consent(request: web.Request) -> web.Response:
+    """Mint consent + session, persist them, set cookies, redirect to root.
+
+    Two rows are written here, none later: one to data/consent.jsonl
+    (records the agreement itself), one to data/sessions.jsonl (acts as
+    the per-session provenance row so eval can join on session_id
+    without waiting for a /__provenance POST from a generator).
+
+    The raw User-Agent is derived into a coarse bucket at this point and
+    immediately discarded — neither the raw UA nor the source IP ever
+    persists for human-real traffic.
+    """
+    raw_ua = request.headers.get("User-Agent", "")
+    bucket = ua_bucket(raw_ua)
+    if "-" in bucket:
+        browser_family, device_type = bucket.split("-", 1)
+    else:
+        browser_family, device_type = bucket, "unknown"
+
+    consent_id = uuid.uuid4().hex
+    sid = make_session_id()
+    now = time.time()
+
+    consent_row = {
+        "ts": now,
+        "consent_id": consent_id,
+        "consent_text_version": CONSENT_TEXT_VERSION,
+        "ua_bucket": bucket,
+    }
+    await write_consent_log(consent_row)
+
+    # Synthetic provenance — class/family/target/etc. mirror what a
+    # generator would POST to /__provenance. The consent_text_version
+    # doubles as `generator_version` so sweeps can group by it.
+    provenance_payload = {
+        "class": "human",
+        "family": "human_real",
+        "target_app": TARGET_APP,
+        "security_level": SECURITY_LEVEL,
+        "stealth": False,
+        "generator": "human_real",
+        "generator_version": CONSENT_TEXT_VERSION,
+        "extra": {
+            "browser_family": browser_family,
+            "device_type": device_type,
+            "consent_id": consent_id,
+        },
+    }
+    cfg_blob = json.dumps(provenance_payload, sort_keys=True, separators=(",", ":")).encode()
+    session_row = {
+        "ts": now,
+        "session_id": sid,
+        "src_label": "human_real",
+        "class": "human",
+        "family": "human_real",
+        "target_app": TARGET_APP,
+        "security_level": SECURITY_LEVEL,
+        "stealth": False,
+        "generator": "human_real",
+        "generator_version": CONSENT_TEXT_VERSION,
+        "generator_config_sha": hashlib.blake2b(cfg_blob, digest_size=4).hexdigest(),
+        "extra": provenance_payload["extra"],
+    }
+    await write_session_log(session_row)
+
+    resp = web.Response(status=302, headers={"Location": "/"})
+    resp.set_cookie(
+        "cernis_consent", consent_id,
+        httponly=True, path="/", samesite="Lax",
+    )
+    resp.set_cookie(
+        "cernis_sid", sid,
+        httponly=True, path="/", samesite="Lax",
+    )
+    return resp
+
+
+@web.middleware
+async def consent_gate_middleware(request: web.Request, handler):
+    """Front of the human-channel middleware chain.
+
+    /__consent + /__consent/accept short-circuit here so the downstream
+    session/logging middleware never runs for them (no sid is minted,
+    no row is written). Every other path is rejected with 403 until the
+    cernis_consent cookie is present.
+    """
+    if request.path == "/__consent" and request.method == "GET":
+        return await serve_consent(request)
+    if request.path == "/__consent/accept" and request.method == "POST":
+        return await accept_consent(request)
+    if not request.cookies.get("cernis_consent"):
+        return web.Response(
+            status=403,
+            body=_BLOCKED_BODY,
+            content_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+    return await handler(request)
+
+
 async def honeypot_robots(request: web.Request) -> web.Response:
     return await request.app["honeypot"].handle_robots(
         request, request["_sid"], request["_label"]
@@ -380,10 +546,23 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     return web.Response(status=status, body=resp_body, headers=resp_headers)
 
 
-def make_app(*, label: Optional[str], default_from_header: bool) -> web.Application:
+def make_app(
+    *,
+    label: Optional[str],
+    default_from_header: bool,
+    is_human_channel: bool = False,
+) -> web.Application:
+    # Consent gate runs ahead of session_and_log_middleware on the human
+    # channel — its purpose is to terminate the request before any sid
+    # is minted or any row is written if consent is missing.
+    middlewares = (
+        [consent_gate_middleware, session_and_log_middleware]
+        if is_human_channel
+        else [session_and_log_middleware]
+    )
     app = web.Application(
         client_max_size=16 * 1024 * 1024,
-        middlewares=[session_and_log_middleware],
+        middlewares=middlewares,
     )
 
     def label_for(request: web.Request) -> str:
@@ -392,6 +571,7 @@ def make_app(*, label: Optional[str], default_from_header: bool) -> web.Applicat
         return request.headers.get("X-Cernis-Source", "unknown")
 
     app["label_for"] = label_for
+    app["is_human_channel"] = is_human_channel
     app["honeypot"] = honeypots.HoneypotLayer(DATA_DIR)
 
     async def on_startup(app):
@@ -415,8 +595,8 @@ def make_app(*, label: Optional[str], default_from_header: bool) -> web.Applicat
 
 
 async def run() -> None:
-    internal = make_app(label=None, default_from_header=True)
-    human = make_app(label="human_real", default_from_header=False)
+    internal = make_app(label=None, default_from_header=True, is_human_channel=False)
+    human = make_app(label="human_real", default_from_header=False, is_human_channel=True)
 
     internal_runner = web.AppRunner(internal)
     human_runner = web.AppRunner(human)

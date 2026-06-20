@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 demo_foreign.csv
+
+# host pipeline campaign data (range-side dumps + scored output +
+# runtime manifest). Nothing under data/host/ is committed — drop your
+# raw inputs in by hand, the rest is runtime output.
+data/host/*
+!data/host/.gitkeep

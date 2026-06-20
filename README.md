@@ -93,6 +93,16 @@ temporal-attack-pattern dataset, Windows/Sysmon logs via `adapter_winlogs.py`)
 is wired and code-exercised on demo loaders; running against a live dataset
 needs a networked environment.
 
+### Host telemetry pipeline (`pipeline/`)
+
+Real-data ingest for the host detector: Sysmon dump + CALDERA op
+report → labeled normalized events → 32-event windows → detector. Ships
+with an in-sandbox synthetic dry-run that exercises the full path, and
+range-side instructions for running against an authorized isolated
+lab. Phase 1 covers ingest + per-campaign provenance manifest; phase 2
+adds Atomic Red Team (held-out emulation family), normal-workload, and
+hard-negative generators. See [`pipeline/README.md`](./pipeline/README.md).
+
 ## License
 
 [MIT](./LICENSE) © 2026 Jack Adams-Lovell

@@ -184,23 +184,132 @@ Group key: `campaign_id`. Append-only. One row per scored campaign:
 | `source_path` | relative dir under `data/host/` |
 | `notes` | free-form |
 
-## What phase 1 explicitly does *not* do
+## Phase 2 — Atomic Red Team + normal workload + hard negatives + held-out emulation
 
-- **Atomic Red Team integration.** Phase 2 — the held-out emulation
-  family. The crosswalk in `adapter_winlogs.ATTACK_ID_TO_TACTIC` covers
-  the techniques Atomic exercises in scope; gaps surface in the
-  `unmapped ids` log line and get patched in then.
-- **Normal-workload generator** (scripted daily user/admin activity)
-  and **hard-negative generator** (PowerShell remoting, WMI, scheduled
-  task creation, sanctioned internal vuln scan, backup / AV jobs).
-  Phase 2 adds both — they share this same provenance schema, the
-  ingest path is unchanged.
-- **Held-out family sweep** (train CALDERA, eval Atomic, and vice
-  versa). Lands when both families exist.
-- **Hard-negative FP rate as a separate report.** Lands when the
-  benign_subtype rows exist.
-- **Re-documented session-level alert-fatigue arithmetic on real
-  data.** Lands when there's enough real data to do the arithmetic on.
+Phase 1 had a single source type (CALDERA) and a single class
+(`attack`). Phase 2 widens both axes:
 
-The schema, the ingest path, and the manifest writer are all designed
-so phase 2 slots in without rewrites.
+### Campaign sources (auto-detected per directory)
+
+| metadata file | class | framework | use |
+|---|---|---|---|
+| `caldera_op.json` | `attack` | `caldera` | CALDERA operation report (phase 1) |
+| `atomic_invocations.json` | `attack` | `atomic` | Atomic Red Team invocations log — the **held-out emulation family** |
+| `workload.json` (class=`normal`) | `normal` | `scripted` | bulk benign baseline (browsing / IDE / Outlook / updates) |
+| `workload.json` (class=`hard_negative`, with `benign_subtype`) | `hard_negative` | `scripted` | sanctioned admin activity that looks scary |
+
+`score_campaign.py` auto-detects which file is present and routes to
+the right labeler. For `class=normal` and `class=hard_negative` no
+attack labels are resolved (`label=0` everywhere) but the campaign
+still gets a provenance row + a `scored.jsonl` so the FP/hour
+denominator sees it during eval.
+
+### Held-out emulation family eval (`score_heldout_emulation.py`)
+
+The host-side mirror of phase 8 on the web harness. For each direction
+(`train_caldera_eval_atomic` and `train_atomic_eval_caldera`):
+
+1. Train `HistGradientBoostingClassifier` on the train framework's
+   attack campaigns plus ALL benign campaigns (normal + hard_negative).
+   Hard-negatives appear in train so the model sees the "looks scary,
+   isn't" pattern at least once.
+2. Pick τ to meet the FP/hour budget on the eval slice (last 25% of
+   benign campaigns by sort order + the eval framework's attack
+   campaigns).
+3. Report **PR-AUC**, **FP/hour**, **per-tactic macro recall** (over
+   the six modeled tactics), and **hard-negative FP rate by
+   `benign_subtype`** on the eval slice.
+4. Swap directions; repeat.
+
+NEVER reports accuracy. Output lands in `data/host/heldout_emulation.json`.
+
+### Synth dry-run (in-sandbox)
+
+```sh
+# one of each campaign type
+python3 -m pipeline.synth_caldera        --campaign synth-caldera-001
+python3 -m pipeline.synth_atomic         --campaign synth-atomic-001
+python3 -m pipeline.synth_workload       --campaign workload-001
+python3 -m pipeline.synth_hard_negatives --campaign hardneg-ps-remoting-001 --benign-subtype ps_remoting
+python3 -m pipeline.synth_hard_negatives --campaign hardneg-sched-task-001  --benign-subtype sched_task
+
+# score them — each appends a provenance row + writes scored.jsonl
+python3 -m pipeline.score_campaign --campaign synth-caldera-001 --synth-mix 6 --adversary synth_six_tactic
+python3 -m pipeline.score_campaign --campaign synth-atomic-001  --synth-mix 6
+python3 -m pipeline.score_campaign --campaign workload-001      --synth-mix 6
+python3 -m pipeline.score_campaign --campaign hardneg-ps-remoting-001 --synth-mix 6
+python3 -m pipeline.score_campaign --campaign hardneg-sched-task-001  --synth-mix 6
+
+# held-out emulation eval
+python3 -m pipeline.score_heldout_emulation
+```
+
+Or run the full sequence + assertions in one shot:
+
+```sh
+python3 -m pipeline.smoke_phase2     # ~13s, no docker, no real Sysmon
+```
+
+Smoke verifies: all five manifest rows have the expected (class,
+framework, benign_subtype) combination, both attack campaigns cover
+all six tactics, scored.jsonl is emitted per campaign, and the
+held-out report has both directions populated with `pr_auc /
+fp_per_hour / per_tactic / hard_negative_fp_by_subtype`.
+
+### Real-data setup (runs *outside* this sandbox)
+
+On your authorized lab range, alongside the phase-1 CALDERA setup:
+
+**Atomic Red Team** — install on each Windows host, invoke per
+technique from the operator's PowerShell session, capture each
+invocation's `t_start` / `t_end`:
+
+```ps1
+Install-Module -Name invoke-atomicredteam -Scope CurrentUser
+Import-Module invoke-atomicredteam
+$invocations = @()
+foreach ($tid in @("T1059","T1057","T1003","T1021","T1041","T1083")) {
+    Invoke-AtomicTest $tid -GetPrereqs
+    $ts = (Get-Date).ToUnixTimeSeconds()
+    Invoke-AtomicTest $tid
+    $te = (Get-Date).ToUnixTimeSeconds()
+    $invocations += @{
+        host = $env:COMPUTERNAME; technique_id = $tid
+        atomic_name = $tid; t_start = $ts; t_end = $te
+        executor = "powershell"; command_hash = ""
+    }
+}
+@{ framework = "atomic-red-team"
+   version = (Get-Module invoke-atomicredteam).Version.ToString()
+   invocations = $invocations
+} | ConvertTo-Json -Depth 5 > atomic_invocations.json
+```
+
+Drop `atomic_invocations.json` + matching Sysmon range into
+`data/host/<campaign_id>/`, then `python3 -m pipeline.score_campaign`.
+
+**Normal workload + hard negatives** — capture the matching Sysmon
+range during ordinary user activity, and during sanctioned admin
+work (PS remoting / WMI / scheduled tasks / internal vuln scan /
+backup jobs). Drop into `data/host/<campaign_id>/` along with a
+hand-written `workload.json` containing `class`, `framework`,
+`host_list`, `ts_start`, `ts_end`, and (for hard negatives)
+`benign_subtype`.
+
+### What phase 2 explicitly does *not* do
+
+- **Re-documented alert-fatigue arithmetic on real data.** The
+  formula sits in the web harness README; the meaningful denominator
+  on the host side comes from multi-day real-range telemetry, not
+  five synth campaigns.
+- **WEC / winlogbeat collector tuning docs.** Lab-side; the real-data
+  section sketches the shape but doesn't go deep.
+- **Multi-day campaign aggregation.** One campaign = one CALDERA op
+  or one shift of activity for now. Spanning days requires either
+  longer windows or a different group key.
+
+## What phase 1 explicitly does *not* do (historical)
+
+Phase 1 originally deferred Atomic, normal-workload, hard-negative,
+held-out family sweep, and per-subtype FP reporting to phase 2. All
+five are now shipped — see the section above.

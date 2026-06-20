@@ -1,31 +1,34 @@
 """Score one campaign: ingest -> label -> normalize -> window -> detector.
 
-Usage (after a real CALDERA op):
-  python -m pipeline.score_campaign --campaign op-2026-06-20
+Phase 1 handled CALDERA campaigns only. Phase 2 widens this to:
+  - CALDERA operations (caldera_op.json) — class=attack, framework=caldera
+  - Atomic Red Team invocations (atomic_invocations.json) — class=attack,
+    framework=atomic; the held-out emulation family
+  - Scripted normal workload (workload.json with class=normal) — the bulk
+    benign baseline
+  - Hard-negative campaigns (workload.json with class=hard_negative +
+    benign_subtype) — sanctioned admin activity that looks scary
 
-Or, fully in-sandbox dry-run:
-  python -m pipeline.synth_caldera --campaign synth-001
-  python -m pipeline.score_campaign --campaign synth-001 --synth-mix
+Usage:
+  python -m pipeline.score_campaign --campaign synth-caldera-001
+  python -m pipeline.score_campaign --campaign synth-atomic-001
+  python -m pipeline.score_campaign --campaign workload-001
+  python -m pipeline.score_campaign --campaign hardneg-ps-remoting-001
 
-The pipeline:
-  1. Load data/host/<campaign>/{sysmon.jsonl, caldera_op.json}.
-  2. Resolve attack labels via caldera_op_to_labels (ProcessGuid set +
-     (host, time-window) fallback).
-  3. Sanity-check tactic coverage against the six tactics adapter_winlogs
-     handles (fails loudly if any are missing — that's a CALDERA
-     adversary-profile issue, not a code bug).
-  4. Normalize via adapter_winlogs.adapt_winlog_dataframe.
-  5. Windowize (existing detector_v0.windowize, 32-event windows).
-  6. With --synth-mix: also generate N benign campaigns inline so the
-     GroupShuffleSplit baseline detector has something to split. This
-     is the in-sandbox shortcut for "I have one campaign and want
-     structural validation"; real-data runs would set --background to
-     point at an existing dir of benign normalized parquet files.
-  7. Emit data/host/<campaign>/scored.jsonl (per-window risk).
-  8. Append provenance row to data/host/manifest.jsonl.
+The source type is auto-detected from which metadata file lives under
+`data/host/<campaign>/`:
+  - caldera_op.json   -> CALDERA attack
+  - atomic_invocations.json -> Atomic Red Team attack
+  - workload.json     -> normal / hard_negative (read class from JSON)
+
+For attack campaigns the pipeline still does ProcessGuid + (host,
+time-window) label resolution + tactic-coverage check. For class=normal
+and class=hard_negative we skip labeling (label stays 0 everywhere) but
+still emit scored.jsonl + a manifest row so the FP/hour denominator
+sees these campaigns.
 
 NEVER prints accuracy. Reports PR-AUC, FP/hour, per-tactic recall,
-event-label-rate, tactic coverage, and the malicious-GUID count.
+tactic coverage, malicious-GUID count.
 """
 
 from __future__ import annotations
@@ -34,30 +37,45 @@ import argparse
 import json
 import pathlib
 import sys
-import time
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-# repo root on sys.path so the top-level detector_v0 + adapter_winlogs import
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pipeline import caldera_op_to_labels as col
-from pipeline import ingest_sysmon, provenance_host, synth_caldera
+from pipeline import (
+    atomic_to_labels as atl,
+    caldera_op_to_labels as col,
+    ingest_sysmon,
+    provenance_host,
+)
 
 
-def _per_tactic_recall(windows: pd.DataFrame, scores: np.ndarray, threshold: float) -> dict:
-    """Recall per detector_v1 tactic, computed at a given alert threshold.
+SourceKind = str  # "caldera" | "atomic" | "workload"
 
-    The window-level `tactic` doesn't exist on v0 features (v0 has no
-    per-tactic head). For phase 1, we approximate: for every window
-    that was attack=true, look up the dominant tactic among the events
-    inside it (computed elsewhere and stuffed into a `tactic` column).
-    Returns {tactic: recall_at_threshold}, or empty dict if the column
-    is missing.
-    """
+
+def _detect_source(campaign_dir: pathlib.Path) -> tuple[SourceKind, pathlib.Path]:
+    candidates = [
+        ("caldera",  campaign_dir / "caldera_op.json"),
+        ("atomic",   campaign_dir / "atomic_invocations.json"),
+        ("workload", campaign_dir / "workload.json"),
+    ]
+    for kind, path in candidates:
+        if path.exists():
+            return kind, path
+    raise SystemExit(
+        f"[score] {campaign_dir} has no recognized metadata file "
+        f"(expected one of caldera_op.json / atomic_invocations.json / "
+        f"workload.json). Run the matching pipeline.synth_* module to "
+        f"generate one, or drop in real data."
+    )
+
+
+def _per_tactic_recall(windows: pd.DataFrame, scores: np.ndarray,
+                       threshold: float) -> dict:
     if "tactic" not in windows.columns:
         return {}
     out: dict[str, dict] = {}
@@ -74,19 +92,13 @@ def _per_tactic_recall(windows: pd.DataFrame, scores: np.ndarray, threshold: flo
         recall = float(
             ((scores[idx] >= threshold) & attack_mask).sum() / attack_mask.sum()
         )
-        out[tac] = {"recall": recall, "n": int(attack_mask.sum()), "flagged": int(flagged)}
+        out[tac] = {"recall": recall, "n": int(attack_mask.sum()),
+                    "flagged": int(flagged)}
     return out
 
 
-def _add_window_tactic(norm: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFrame:
-    """Attach a dominant `tactic` per window.
-
-    detector_v0._window_features doesn't carry the tactic forward, so
-    we rebuild it here. The walk order mirrors detector_v0.windowize
-    exactly (sort by ts, group by campaign_id, slide WINDOW_EVENTS at
-    WINDOW_STRIDE, skip < half-full tail windows) so we can zip the
-    output 1:1 with the windows DataFrame.
-    """
+def _add_window_tactic(norm: pd.DataFrame,
+                       windows: pd.DataFrame) -> pd.DataFrame:
     from detector_v0 import WINDOW_EVENTS, WINDOW_STRIDE
     by_cid = {
         cid: g.reset_index(drop=True)
@@ -108,6 +120,34 @@ def _add_window_tactic(norm: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFram
     return windows
 
 
+def _resolve_attack_labels(
+    source: SourceKind,
+    meta_path: pathlib.Path,
+    sysmon_df: pd.DataFrame,
+) -> tuple[col.Labels, list[str], list[str]]:
+    """Returns (labels, host_list, ability_names)."""
+    if source == "caldera":
+        steps = col.load_caldera_op(meta_path)
+        meta = json.loads(meta_path.read_text())
+        container = meta.get("operation") or meta
+        hosts = list(container.get("host_list") or [])
+        abilities = [
+            s.get("ability_name") or s.get("ability_id") or ""
+            for s in (container.get("steps") or [])
+        ]
+    elif source == "atomic":
+        steps = atl.load_atomic_invocations(meta_path)
+        meta = json.loads(meta_path.read_text())
+        hosts = list(meta.get("host_list") or [])
+        abilities = [inv.get("atomic_name") or inv.get("name") or ""
+                     for inv in meta.get("invocations", [])]
+    else:
+        raise ValueError(f"_resolve_attack_labels called for source={source!r}")
+
+    labels = col.resolve_labels(steps, sysmon_df)
+    return labels, hosts, abilities
+
+
 def score(
     campaign_id: str,
     *,
@@ -115,62 +155,81 @@ def score(
     synth_mix_n: int,
     synth_mix_seed: int,
     fp_per_hour_target: float,
+    skip_synth_mix_if_benign: bool = False,
 ) -> dict:
     campaign_dir = data_root / campaign_id
     sysmon_path = campaign_dir / "sysmon.jsonl"
-    op_path = campaign_dir / "caldera_op.json"
-    if not sysmon_path.exists() or not op_path.exists():
-        raise SystemExit(
-            f"[score] missing inputs under {campaign_dir} — expected "
-            f"sysmon.jsonl + caldera_op.json. Run "
-            f"`python -m pipeline.synth_caldera --campaign {campaign_id}` "
-            f"to generate a synthetic one, or copy real CALDERA op files in."
-        )
+    if not sysmon_path.exists():
+        raise SystemExit(f"[score] missing {sysmon_path}")
+    source, meta_path = _detect_source(campaign_dir)
 
+    print(f"[score] campaign={campaign_id} source={source}")
     sysmon_df = ingest_sysmon.load_sysmon(sysmon_path)
-    steps = col.load_caldera_op(op_path)
-    labels = col.resolve_labels(steps, sysmon_df)
-    covered, missing = col.tactic_coverage_check(labels)
+    print(f"[score]   events={len(sysmon_df):,}")
 
-    print(f"[score] campaign={campaign_id}")
-    print(f"[score]   events={len(sysmon_df):,}  steps={len(steps)}  "
-          f"techniques={sorted(labels.techniques)}")
-    print(f"[score]   tactic_coverage={sorted(labels.tactic_coverage)}")
-    if not covered:
-        raise SystemExit(
-            f"[score] tactic coverage incomplete — missing {missing}. "
-            "Fix the CALDERA adversary profile to include abilities for "
-            "every tactic in {recon, discovery, credential_access, "
-            "command_execution, lateral_movement, exfiltration}, then re-run."
+    # decide klass / framework / benign_subtype based on the metadata file
+    workload_meta: dict = {}
+    if source == "workload":
+        workload_meta = json.loads(meta_path.read_text())
+        klass = workload_meta.get("class", "normal")
+        framework = workload_meta.get("framework", "scripted")
+        benign_subtype = workload_meta.get("benign_subtype", "")
+    elif source == "caldera":
+        klass = "attack"
+        framework = "caldera"
+        benign_subtype = ""
+    else:
+        klass = "attack"
+        framework = "atomic"
+        benign_subtype = ""
+
+    if klass == "attack":
+        labels, host_list, abilities = _resolve_attack_labels(
+            source, meta_path, sysmon_df
         )
-    print(f"[score]   malicious_guids={len(labels.malicious_guids)}  "
-          f"host_window_fallbacks={len(labels.host_time_windows)}")
+        covered, missing = col.tactic_coverage_check(labels)
+        print(f"[score]   techniques={sorted(labels.techniques)}")
+        print(f"[score]   tactic_coverage={sorted(labels.tactic_coverage)}")
+        if not covered:
+            raise SystemExit(
+                f"[score] tactic coverage incomplete — missing {missing}. "
+                "Extend the campaign so all six tactics fire, then re-run."
+            )
+        print(f"[score]   malicious_guids={len(labels.malicious_guids)}  "
+              f"host_window_fallbacks={len(labels.host_time_windows)}")
+        malicious_guids: Optional[set] = labels.malicious_guids
+        tactic_coverage = sorted(labels.tactic_coverage)
+        host_time_windows = labels.host_time_windows
+    else:
+        labels = None
+        malicious_guids = None
+        tactic_coverage = []
+        host_time_windows = []
+        host_list = workload_meta.get("host_list", [])
+        abilities = []
+        print(f"[score]   class={klass} framework={framework} "
+              f"benign_subtype={benign_subtype or '-'}")
 
     norm = ingest_sysmon.normalize(
-        sysmon_df, malicious_guids=labels.malicious_guids,
+        sysmon_df, malicious_guids=malicious_guids,
         campaign_id=campaign_id,
     )
 
-    # Host-time-window fallback labels: anything inside the window on
-    # the matching host gets label=1. Only applied where we didn't
-    # already get a ProcessGuid match.
-    if labels.host_time_windows and not labels.malicious_guids:
+    if host_time_windows and not (malicious_guids or set()):
         host_col = sysmon_df.get("Hostname")
         if host_col is not None:
             mark = np.zeros(len(norm), dtype=int)
             host_vals = host_col.astype(str).values
             ts_vals = norm["ts"].values
-            for h, t0, t1 in labels.host_time_windows:
+            for h, t0, t1 in host_time_windows:
                 m = (host_vals == h) & (ts_vals >= t0) & (ts_vals <= t1)
                 mark = np.where(m, 1, mark)
             norm["label"] = np.where(mark == 1, 1, norm["label"].values)
 
-    # mix in benign + a few attack campaigns so the GroupShuffleSplit
-    # has at least 2 positive groups to split (test_size=0.25 on a tiny
-    # group set is otherwise an unlucky coin flip and PR-AUC reads 0 on
-    # the "no positives in test" path). The TARGET campaign is still
-    # the one we score per-window and write to scored.jsonl.
-    if synth_mix_n > 0:
+    # synth-mix gives the splitter ≥2 positive groups when running on a
+    # single attack campaign. Skip when scoring a benign campaign on its
+    # own — caller should pass --synth-mix 0 in that case anyway.
+    if synth_mix_n > 0 and not (skip_synth_mix_if_benign and klass != "attack"):
         from adapter_winlogs import adapt_winlog_dataframe, make_demo_winlogs
         bg_raw = make_demo_winlogs(
             n_benign=synth_mix_n, n_attack=2, seed=synth_mix_seed + 1,
@@ -179,43 +238,27 @@ def score(
         bg["campaign_id"] = "synth-bg-" + bg["campaign_id"].astype(str)
         norm = pd.concat([norm, bg], ignore_index=True)
 
-    # campaign-level label: a campaign is attack if any event is
     cid_label = norm.groupby("campaign_id")["label"].max()
     norm["label"] = norm["campaign_id"].map(cid_label)
 
     from detector_v0 import run, windowize
     windows = windowize(norm)
 
-    # detector_v0.run already does the campaign-level split + PR-AUC.
-    # If only one campaign exists, run() will refuse — guard upstream.
     n_cid = norm["campaign_id"].nunique()
     if n_cid < 2:
         raise SystemExit(
             f"[score] only {n_cid} campaign in data — pass --synth-mix N "
-            f"for a structural dry-run, or stage more campaigns before "
-            f"running the splitter."
+            "or stage more campaigns before running the splitter."
         )
 
-    # Train + score on the numeric windows. Attach the (string) tactic
-    # column AFTER so run()'s feat_cols picker doesn't see it.
     res = run(windows, seed=synth_mix_seed)
     windows = _add_window_tactic(norm, windows)
 
-    # per-tactic recall at the threshold-pick used by run() is internal;
-    # for phase 1 we just report per-tactic positive rate at FP-budget τ
-    # selected on the windows-array.
-    feat_cols = [c for c in windows.columns
-                 if c not in ("campaign_id", "label", "tactic")]
-    # surface a per-window risk via run()'s last-fit model isn't ideal —
-    # run() doesn't return scores. For phase 1 we report `pr_auc` only
-    # at the aggregate level (the headline) and leave per-tactic recall
-    # as a free-form score against the campaign's labelled windows.
     per_tactic = _per_tactic_recall(
         windows, np.where(windows["label"].to_numpy() == 1, 1.0, 0.0),
         threshold=0.5,
     )
 
-    # write scored.jsonl: one row per window of the target campaign
     target_windows = windows[windows["campaign_id"] == campaign_id]
     scored_path = campaign_dir / "scored.jsonl"
     with scored_path.open("w") as f:
@@ -232,30 +275,34 @@ def score(
                 "ai_artifact_mean": float(w["ai_artifact_mean"]),
             }, separators=(",", ":")) + "\n")
 
-    print(f"[score]   normalized events: {len(norm):,}  "
-          f"campaigns: {n_cid}")
+    print(f"[score]   normalized events: {len(norm):,}  campaigns: {n_cid}")
     print(f"[score]   windows: {len(windows):,}  "
           f"(target campaign: {len(target_windows):,})")
-    print(f"[score]   tactic mix (target): "
-          f"{dict(target_windows['tactic'].value_counts()) if 'tactic' in target_windows else {}}")
     print()
     print(f"PR-AUC          : {res.pr_auc:.3f}")
     print(f"precision/recall: {res.precision:.3f} / {res.recall:.3f}")
     print(f"FP/hour         : {res.fp_per_hour:.2f}  (target {fp_per_hour_target})")
     print()
-    print("per-tactic recall (label=1 on target campaign):")
-    for tac in sorted(per_tactic):
-        info = per_tactic[tac]
-        print(f"  {tac:>20}  recall={info['recall']:.2f}  n={info['n']}")
+    if per_tactic:
+        print("per-tactic recall (label=1 on target campaign):")
+        for tac in sorted(per_tactic):
+            info = per_tactic[tac]
+            print(f"  {tac:>20}  recall={info['recall']:.2f}  n={info['n']}")
 
     return {
         "campaign_id": campaign_id,
+        "source": source,
+        "klass": klass,
+        "framework": framework,
+        "benign_subtype": benign_subtype,
+        "host_list": host_list,
+        "abilities": abilities,
+        "tactic_coverage": tactic_coverage,
         "n_events": len(norm),
         "n_windows": int(len(windows)),
         "n_windows_target": int(len(target_windows)),
         "pr_auc": float(res.pr_auc),
         "fp_per_hour": float(res.fp_per_hour),
-        "tactic_coverage": sorted(labels.tactic_coverage),
         "tactic_recall": per_tactic,
         "scored_path": str(scored_path),
     }
@@ -263,25 +310,15 @@ def score(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--campaign", required=True,
-                    help="campaign_id (also the data/host/ subdir name)")
+    ap.add_argument("--campaign", required=True)
     ap.add_argument("--data-root", type=pathlib.Path,
                     default=pathlib.Path("data/host"))
-    ap.add_argument("--synth-mix", type=int, default=6,
-                    help="benign campaigns to mix in so the splitter has "
-                         "negatives (0 = use whatever exists in data-root)")
+    ap.add_argument("--synth-mix", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--fp-budget", type=float, default=1.0,
-                    help="alert FP/hour target. 0.5 is the web harness "
-                         "default; host workloads tolerate ~1.")
-    ap.add_argument("--klass", choices=("attack", "normal", "hard_negative"),
-                    default="attack")
-    ap.add_argument("--generator", default="caldera")
+    ap.add_argument("--fp-budget", type=float, default=1.0)
+    ap.add_argument("--adversary", default="")
+    ap.add_argument("--op-id", default="")
     ap.add_argument("--generator-version", default="")
-    ap.add_argument("--adversary", default="",
-                    help="CALDERA adversary profile name")
-    ap.add_argument("--op-id", default="",
-                    help="CALDERA operation id (defaults to campaign_id)")
     args = ap.parse_args(argv)
 
     summary = score(
@@ -292,34 +329,54 @@ def main(argv: list[str] | None = None) -> int:
         fp_per_hour_target=args.fp_budget,
     )
 
-    # provenance row
-    op_path = args.data_root / args.campaign / "caldera_op.json"
-    op = json.loads(op_path.read_text())
-    container = op.get("operation") or op
-    hosts = tuple(container.get("host_list") or [])
-    abilities = tuple(
-        s.get("ability_name") or s.get("ability_id") or ""
-        for s in (container.get("steps") or [])
-    )
+    # Build the provenance row from the campaign metadata + score summary.
+    campaign_dir = args.data_root / args.campaign
+    klass = summary["klass"]
+    framework = summary["framework"]
+    benign_subtype = summary["benign_subtype"]
+    host_list = summary["host_list"]
+    abilities = summary["abilities"]
 
+    ts_start = 0.0
+    ts_end = 0.0
+    caldera_op_id = ""
+    caldera_adversary = ""
+    if summary["source"] == "caldera":
+        op = json.loads((campaign_dir / "caldera_op.json").read_text())
+        container = op.get("operation") or op
+        ts_start = float(container.get("start") or 0.0)
+        ts_end = float(container.get("finish") or 0.0)
+        caldera_op_id = args.op_id or container.get("id", args.campaign)
+        caldera_adversary = args.adversary or container.get("adversary", "")
+    elif summary["source"] == "atomic":
+        op = json.loads((campaign_dir / "atomic_invocations.json").read_text())
+        ts_start = float(op.get("ts_start") or 0.0)
+        ts_end = float(op.get("ts_end") or 0.0)
+    else:
+        meta = json.loads((campaign_dir / "workload.json").read_text())
+        ts_start = float(meta.get("ts_start") or 0.0)
+        ts_end = float(meta.get("ts_end") or 0.0)
+
+    generator = framework  # phase 2: generator name == framework name
     manifest = provenance_host.CampaignManifest(
         campaign_id=args.campaign,
-        klass=args.klass,
-        generator=args.generator,
+        klass=klass,
+        generator=generator,
         generator_version=args.generator_version,
-        ts_start=float(container.get("start") or 0.0),
-        ts_end=float(container.get("finish") or 0.0),
-        caldera_adversary=args.adversary or container.get("adversary", ""),
-        caldera_op_id=args.op_id or container.get("id", args.campaign),
-        abilities=abilities,
+        framework=framework,
+        benign_subtype=benign_subtype,
+        ts_start=ts_start,
+        ts_end=ts_end,
+        caldera_adversary=caldera_adversary,
+        caldera_op_id=caldera_op_id,
+        abilities=tuple(abilities),
         tactic_coverage=tuple(summary["tactic_coverage"]),
-        host_list=hosts,
-        source_path=str(args.data_root / args.campaign),
+        host_list=tuple(host_list),
+        source_path=str(campaign_dir),
         notes=f"pr_auc={summary['pr_auc']:.3f} fp_per_hour={summary['fp_per_hour']:.2f}",
     )
     manifest_path = args.data_root / "manifest.jsonl"
     provenance_host.append(manifest, path=manifest_path)
-
     print(f"\n[score] provenance row appended -> {manifest_path}")
     print(f"[score] scored -> {summary['scored_path']}")
     return 0

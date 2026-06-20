@@ -6,13 +6,16 @@ once when the campaign is registered, never depend on tail-end joins
 to recover what the generator was). The host pipeline's group key is
 `campaign_id`, not `session_id`.
 
-Schema:
+Schema (phase 2 additions marked):
   ts                     : unix seconds when the row was written
   campaign_id            : group key
   ts_start, ts_end       : earliest / latest event in this campaign
   class                  : attack | normal | hard_negative
   generator              : caldera | atomic | scripted | manual
   generator_version      : "" or a known version string / git sha
+  framework              : (phase 2) "caldera" | "atomic" | "scripted"
+                           | "manual" — used by held-out emulation eval
+                           to split CALDERA vs Atomic campaigns
   caldera_adversary      : adversary profile name (empty for atomic/normal)
   caldera_op_id          : CALDERA operation id (empty otherwise)
   abilities              : list of ability ids run (empty for normal)
@@ -23,6 +26,9 @@ Schema:
   source_path            : relative path under data/host/ where the
                            raw inputs live
   notes                  : free-form
+  benign_subtype         : (phase 2) hard-negative kind ∈ {ps_remoting,
+                           wmi, sched_task, sanctioned_scan, backup}
+                           or "" for class != hard_negative
 """
 
 from __future__ import annotations
@@ -43,6 +49,13 @@ def config_sha(cfg: dict) -> str:
     return hashlib.blake2b(blob, digest_size=4).hexdigest()
 
 
+VALID_CLASSES = ("attack", "normal", "hard_negative")
+VALID_FRAMEWORKS = ("caldera", "atomic", "scripted", "manual")
+VALID_BENIGN_SUBTYPES = (
+    "", "ps_remoting", "wmi", "sched_task", "sanctioned_scan", "backup",
+)
+
+
 @dataclasses.dataclass
 class CampaignManifest:
     campaign_id: str
@@ -51,6 +64,8 @@ class CampaignManifest:
     ts_start: float
     ts_end: float
     generator_version: str = ""
+    framework: str = ""  # phase 2: explicit emulation framework label
+    benign_subtype: str = ""  # phase 2: hard-negative kind
     caldera_adversary: str = ""
     caldera_op_id: str = ""
     abilities: tuple[str, ...] = ()
@@ -61,12 +76,32 @@ class CampaignManifest:
     notes: str = ""
     extra: dict = dataclasses.field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.klass not in VALID_CLASSES:
+            raise ValueError(f"class={self.klass!r} not in {VALID_CLASSES}")
+        if self.benign_subtype not in VALID_BENIGN_SUBTYPES:
+            raise ValueError(
+                f"benign_subtype={self.benign_subtype!r} not in "
+                f"{VALID_BENIGN_SUBTYPES}"
+            )
+        if self.klass == "hard_negative" and not self.benign_subtype:
+            raise ValueError(
+                "class=hard_negative requires a non-empty benign_subtype"
+            )
+        if not self.framework:
+            # default framework from generator label when not explicitly set
+            self.framework = (
+                self.generator if self.generator in VALID_FRAMEWORKS else "manual"
+            )
+
     def to_row(self) -> dict:
         cfg = {
             "generator": self.generator,
+            "framework": self.framework,
             "version": self.generator_version,
             "adversary": self.caldera_adversary,
             "abilities": list(self.abilities),
+            "benign_subtype": self.benign_subtype,
             "sysmon_config_sha": self.sysmon_config_sha,
         }
         return {
@@ -77,6 +112,8 @@ class CampaignManifest:
             "class": self.klass,
             "generator": self.generator,
             "generator_version": self.generator_version,
+            "framework": self.framework,
+            "benign_subtype": self.benign_subtype,
             "caldera_adversary": self.caldera_adversary,
             "caldera_op_id": self.caldera_op_id,
             "abilities": list(self.abilities),

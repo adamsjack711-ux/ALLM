@@ -200,6 +200,26 @@ def _counts(sessions: list, manifest_splits: dict) -> dict:
     }
 
 
+def _counts_table_md(counts: dict) -> str:
+    """Render the counts dict as a markdown table suitable for
+    inlining into the DATASHEET template via {{COUNTS_TABLE}}."""
+    lines: list[str] = []
+    for axis_key, axis_label in (
+        ("by_class", "by class"),
+        ("by_family", "by family"),
+        ("by_target_app", "by target_app"),
+        ("by_stealth", "by stealth"),
+    ):
+        rows = counts.get(axis_key) or {}
+        if not rows:
+            lines.append(f"- **{axis_label}:** (none)")
+            continue
+        lines.append(f"- **{axis_label}:**")
+        for k in sorted(rows):
+            lines.append(f"  - `{k}`: {rows[k]}")
+    return "\n".join(lines) if lines else "(release has no published sessions)"
+
+
 def build_release(
     *,
     data_dir: pathlib.Path,
@@ -303,11 +323,18 @@ def build_release(
     # 6. Copy code.
     _copy_code_files(src_benchmark, out_dir)
 
-    # 7. Render docs.
+    # 7. Compute counts EARLY so the DATASHEET / TASK / README templates
+    # can substitute them in. They're also re-used for the final manifest.
+    counts = _counts(public_sessions, split_set.manifest["splits"])
+
+    # 8. Render docs.
     substitutions = {
         "VERSION": version, "version": version,
         "BUILT_AT": built_at, "built_at": built_at,
         "SPLITS_VERSION": splitmod.SPLITS_VERSION,
+        "N_PUBLISHED": str(counts["total_sessions_published"]),
+        "N_EXCLUDED": str(len(excluded)),
+        "COUNTS_TABLE": _counts_table_md(counts),
     }
     for name in _DOC_FILES:
         body = _render_template(
@@ -351,7 +378,7 @@ def build_release(
             "clean": True,
             "files_scanned": report.files_scanned,
         },
-        "counts": _counts(public_sessions, split_set.manifest["splits"]),
+        "counts": counts,
         "release_files": release_files,
     }
     manifest_path = out_dir / "manifest.json"

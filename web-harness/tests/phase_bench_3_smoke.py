@@ -406,6 +406,116 @@ def _run_part_b() -> None:
     )
 
 
+# ── PART C: documentation templates ──────────────────────────────────
+
+
+_REQUIRED_DATASHEET_SECTIONS = (
+    "## 1. Motivation",
+    "## 2. Composition",
+    "## 3. Collection Process",
+    "## 4. Preprocessing",
+    "## 5. Uses",
+    "## 6. Distribution",
+    "## 7. Maintenance",
+)
+
+
+def _run_part_c() -> None:
+    from benchmark.release import build_release as brmod  # noqa: PLC0415
+
+    templates_dir = ROOT / "benchmark" / "release" / "templates"
+
+    # (C1) Every expected template file is present on disk.
+    for name in ("README.md", "TASK.md", "DATASHEET.md",
+                  "LICENSE", "LICENSE-DATA"):
+        path = templates_dir / name
+        _assert(
+            path.exists() and path.read_text().strip(),
+            f"[phase-bench-3] missing or empty template: {path}",
+        )
+
+    # (C2) Each template's released form has every {{key}} placeholder
+    # substituted. A surviving `{{…}}` is a release-blocker.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        data_dir = td / "data"
+        data_dir.mkdir()
+        (data_dir / "sessions.jsonl").write_text("")
+        (data_dir / "consent.jsonl").write_text("")
+        out_dir = td / "release" / "cernis-benchmark-v0.1-test"
+        sessions = _synth_feature_sessions(seed=0)
+        brmod.build_release(
+            data_dir=data_dir, out_dir=out_dir,
+            version="v0.1-test", seed=0, sessions=sessions,
+        )
+
+        for name in ("README.md", "TASK.md", "DATASHEET.md",
+                      "LICENSE", "LICENSE-DATA"):
+            body = (out_dir / name).read_text()
+            _assert(
+                "{{" not in body,
+                f"[phase-bench-3] released {name} still contains "
+                f"unsubstituted `{{{{…}}}}` placeholders",
+            )
+            _assert(
+                "placeholder" not in body.lower() or name in ("DATASHEET.md",),
+                # DATASHEET.md may contain the word "placeholder" only if
+                # we accidentally fell back to the stub body (which starts
+                # with "{{TEMPLATE_NAME}} — placeholder"). The check
+                # above already catches that via the {{ marker.
+                f"[phase-bench-3] released {name} body looks like the "
+                f"build_release.py fallback stub",
+            )
+
+        # (C3) DATASHEET has all required Datasheets-for-Datasets sections.
+        datasheet = (out_dir / "DATASHEET.md").read_text()
+        for section in _REQUIRED_DATASHEET_SECTIONS:
+            _assert(
+                section in datasheet,
+                f"[phase-bench-3] DATASHEET.md missing section header {section!r}",
+            )
+
+        # (C4) Substituted version + built_at land in the docs.
+        for name, must_contain in (
+            ("README.md", ("v0.1-test", "MIT", "CC BY 4.0")),
+            ("TASK.md", ("v0.1-test", "PR-AUC", "FP/hour")),
+            ("DATASHEET.md", ("v0.1-test", "Datasheets for Datasets",
+                                "Composition", "consent")),
+        ):
+            body = (out_dir / name).read_text()
+            for needle in must_contain:
+                _assert(
+                    needle in body,
+                    f"[phase-bench-3] released {name} missing expected text {needle!r}",
+                )
+
+        # (C5) Licenses carry the right SPDX identifiers.
+        license_body = (out_dir / "LICENSE").read_text()
+        _assert(
+            "SPDX-License-Identifier: MIT" in license_body,
+            "[phase-bench-3] released LICENSE missing 'SPDX-License-Identifier: MIT'",
+        )
+        license_data_body = (out_dir / "LICENSE-DATA").read_text()
+        _assert(
+            "SPDX-License-Identifier: CC-BY-4.0" in license_data_body,
+            "[phase-bench-3] released LICENSE-DATA missing 'SPDX-License-Identifier: CC-BY-4.0'",
+        )
+
+        # (C6) Counts table substituted into the datasheet has the
+        # axis labels (otherwise build_release silently swapped it for
+        # the empty-input fallback).
+        for axis in ("by class", "by family", "by target_app", "by stealth"):
+            _assert(
+                axis in datasheet,
+                f"[phase-bench-3] DATASHEET counts table missing axis {axis!r}",
+            )
+
+    print(
+        "[phase-bench-3] PART C passed "
+        "(every template renders, DATASHEET has all sections, licenses carry SPDX)"
+    )
+
+
 # ── runner ───────────────────────────────────────────────────────────
 
 
@@ -413,7 +523,7 @@ def main() -> int:
     print("[phase-bench-3] running smoke (offline, no docker)…")
     _run_part_a()
     _run_part_b()
-    # PART C lands in commit 3.
+    _run_part_c()
     print("[phase-bench-3] OK")
     return 0
 

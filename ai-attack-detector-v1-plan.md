@@ -37,6 +37,7 @@ events, stride 16, never crossing campaign boundaries.
 | `detector_v0.py` | aggregate baseline (HistGradientBoosting) | `python detector_v0.py --synthetic` |
 | `detector_v05.py` | GRU over per-event sequences | `python detector_v05.py` |
 | `detector_v1.py` | **ATT&CK multi-label** (risk + per-technique + spans) | `python detector_v1.py --synthetic` |
+| `detector_v2.py` | **hybrid** (aggregate features + GRU hidden state) | `python detector_v2.py --synthetic` |
 | `inspect_dataset.py` | profiles a real dataset, suggests a column mapping | `python inspect_dataset.py --demo` |
 | `adapter_winlogs.py` | Windows/Sysmon event-log adapter (+ ATT&CK→tactic crosswalk) | `python adapter_winlogs.py --demo` |
 
@@ -91,12 +92,48 @@ recall, and attended spans — none of which v0/v0.5 can produce. Risk PR-AUC al
 clears the v0 aggregate baseline by +0.071 because the kill-chain phase structure
 is sequential (ordering the aggregates can't see).
 
-### [ ] Task 2 — Hybrid model
+### [x] Task 2 — Hybrid model  (`detector_v2.py`)
 
-Concatenate v0 aggregate features with the GRU's final hidden state into one
-classifier head. Show on a dataset whose signal is *partly aggregate and partly
-ordering* that the hybrid beats either model alone (all three PR-AUCs, one shared
-split).
+Shipped. `HybridDetector` runs the GRU over the event sequence, takes its final
+hidden state, **concatenates the v0 aggregate feature vector**, and feeds the
+fusion to one jointly-trained MLP head.
+
+The synthetic data gives attacks two *orthogonal, partial* signals and assigns
+most campaigns only one of them, so neither single model can be complete:
+
+- **breadth** (aggregate-visible, GRU-blind): the attack fans out across many
+  distinct targets — carried by `distinct_targets` / `target_churn`, which the
+  GRU never sees (target identity isn't in the sequence features).
+- **ordering** (GRU-visible, aggregate-blind): a doubly-stochastic action
+  transition structure — marginal action frequencies match benign, so the
+  aggregate histogram can't see it; only a sequence model can.
+
+Timing/depth/ai are identical across classes (no signal). Attack modes:
+aggregate-only / ordering-only / both / stealth(neither); the stealth fraction
+is uncatchable and keeps PR-AUC under 1.
+
+Measured on one shared campaign-level split (`--synthetic`, seed 0, 6,244
+windows, 30.3% attack):
+
+| model | PR-AUC |
+|-------|-------:|
+| v0 aggregate-only (breadth-visible, order-blind) | 0.759 |
+| v0.5 GRU-only (order-visible, breadth-blind) | 0.720 |
+| **v2 hybrid (both channels)** | **0.942**  (lift over best single **+0.183**) |
+
+Hybrid @ train-tuned threshold: precision 0.954, recall 0.858, **FP/hour 0.31**.
+
+Recall by attack mode makes the mechanism explicit:
+
+| mode | aggregate | GRU | hybrid |
+|------|----------:|----:|-------:|
+| aggregate-only | 0.921 | 0.037 | 0.902 |
+| ordering-only | 0.127 | 0.887 | 0.853 |
+| both | 0.959 | 0.856 | 1.000 |
+| stealth | 0.120 | 0.000 | 0.040 |
+
+Each single model is blind to the other's channel (0.037, 0.127); the hybrid
+recovers both groups, which is why its PR-AUC clears either model alone.
 
 ### [ ] Task 3 — Real-data wiring + tiny serving loop
 

@@ -3,9 +3,20 @@
 Reports (NEVER accuracy):
   - PR-AUC                       (sklearn average_precision_score)
   - FP/hour                      (per session-hour of the test set)
-  - per-generator recall         (at chosen threshold)
+  - per-generator alert rate     (TPR for agents, FPR for benign — back-compat)
+  - per-family recall            (phase 8: keyed on the resolved family
+                                  label, with `kind` ∈ {agent, benign_bot,
+                                  human, unknown})
+  - per-target_app slice         (phase 8: alert rate per target app)
+  - agent-vs-benign_bot block    (phase 8: confusion specifically between
+                                  agent sessions and the benign automation
+                                  class, since detecting that one is the
+                                  load-bearing question once benign_bot
+                                  families are in the data)
   - honeypot precision           (data-only, no model)
-  - ML-only PR-AUC + recall      (head trained without honeypot inputs)
+  - ML-only PR-AUC + recall      (head trained without honeypot inputs —
+                                  the "honeypots-disabled run" the spec
+                                  asks for)
   - mean time-to-flag            (from the streaming alerter at chosen τ)
   - threshold-picking detail     (FP/hour budget targeted on test set;
                                   with a tiny dataset this often forces
@@ -132,6 +143,92 @@ def evaluate_head(
             "kind": "agent" if is_agent_class else "benign",
         }
 
+    # phase 8: per-family rollup keyed on the resolved family from the
+    # provenance manifest / phase 6 schema. `kind` is the resolved class
+    # so eval consumers can distinguish agent-recall from benign_bot-FPR
+    # from human-FPR.
+    per_family: dict[str, dict] = {}
+    families = {s.family for s in test_sess if s.family}
+    for fam in families:
+        mask = np.array([s.family == fam for s in test_sess])
+        if mask.sum() == 0:
+            continue
+        n = int(mask.sum())
+        pos = int(((pred == 1) & mask).sum())
+        klasses = [s.klass for s, m in zip(test_sess, mask) if m]
+        kind = max(set(klasses), key=klasses.count) if klasses else "unknown"
+        rate = pos / max(n, 1)
+        per_family[fam] = {
+            "test_sessions": n,
+            "alerts": pos,
+            "alert_rate": rate,
+            "kind": kind,
+            # for agents this is recall (we want it high); for benign_bot
+            # and human it's a false-positive rate (we want it low).
+            "recall_if_agent": rate if kind == "agent" else None,
+            "fp_rate_if_benign": rate if kind in ("benign_bot", "human") else None,
+        }
+
+    # phase 8: per-target_app slice — multi-target sweep wants to know
+    # whether the detector behaves differently on DVWA vs juice_shop vs
+    # vampi (the no-DOM API target).
+    per_target_app: dict[str, dict] = {}
+    target_apps = {s.target_app for s in test_sess if s.target_app}
+    for app in target_apps:
+        mask = np.array([s.target_app == app for s in test_sess])
+        if mask.sum() == 0:
+            continue
+        n = int(mask.sum())
+        pos = int(((pred == 1) & mask).sum())
+        n_pos_label = int(y[mask].sum())
+        n_neg_label = int((y[mask] == 0).sum())
+        per_target_app[app] = {
+            "test_sessions": n,
+            "alerts": pos,
+            "alert_rate": pos / max(n, 1),
+            "n_agent_truth": n_pos_label,
+            "n_benign_truth": n_neg_label,
+        }
+
+    # phase 8: agent-vs-benign_bot confusion specifically. The detector's
+    # hardest job once the negative class is no longer just `human_sim`
+    # is to NOT alert on legitimate non-browser bots. This block isolates
+    # that question from human-vs-agent.
+    agent_mask = np.array([s.klass == "agent" for s in test_sess])
+    benign_bot_mask = np.array([s.klass == "benign_bot" for s in test_sess])
+    pred_alert = pred == 1
+    n_agent_alert = int((agent_mask & pred_alert).sum())
+    n_agent_miss = int((agent_mask & ~pred_alert).sum())
+    n_benign_fp = int((benign_bot_mask & pred_alert).sum())
+    n_benign_ok = int((benign_bot_mask & ~pred_alert).sum())
+    benign_per_fam: dict[str, dict] = {}
+    for fam in {s.family for s, m in zip(test_sess, benign_bot_mask) if m}:
+        fmask = np.array([s.family == fam and s.klass == "benign_bot"
+                          for s in test_sess])
+        if fmask.sum() == 0:
+            continue
+        fp_here = int((fmask & pred_alert).sum())
+        benign_per_fam[fam] = {
+            "test_sessions": int(fmask.sum()),
+            "false_positives": fp_here,
+            "fp_rate": fp_here / max(int(fmask.sum()), 1),
+        }
+    agent_vs_benign_bot = {
+        "n_agent_truth": int(agent_mask.sum()),
+        "n_benign_bot_truth": int(benign_bot_mask.sum()),
+        "agent_recall": (n_agent_alert / int(agent_mask.sum())
+                         if agent_mask.sum() else None),
+        "benign_bot_fp_rate": (n_benign_fp / int(benign_bot_mask.sum())
+                               if benign_bot_mask.sum() else None),
+        "confusion": {
+            "true_agent_pred_alert": n_agent_alert,
+            "true_agent_pred_benign": n_agent_miss,
+            "true_benign_bot_pred_alert": n_benign_fp,
+            "true_benign_bot_pred_benign": n_benign_ok,
+        },
+        "per_benign_family_fp": benign_per_fam,
+    }
+
     pr_curve = None
     try:
         prec, rec, thr = precision_recall_curve(y, scores)
@@ -153,6 +250,9 @@ def evaluate_head(
         "fp_per_hour": fp_per_hour,
         "session_hours_test": tpick["session_hours"],
         "per_source": per_src,
+        "per_family": per_family,
+        "per_target_app": per_target_app,
+        "agent_vs_benign_bot": agent_vs_benign_bot,
         "pr_curve_sample": pr_curve,
     }
 

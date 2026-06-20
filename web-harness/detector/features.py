@@ -27,8 +27,35 @@ from typing import Iterable
 
 import numpy as np
 
-AGENT_LABELS = frozenset({"playwright_bot", "pentesterpro"})
+# Agent and benign-bot family labels.
+#
+# `AGENT_LABELS` is the legacy hardcoded set used to derive `y` for rows
+# from phases 1-5 (pre-phase-6 data has no `class` column). Phase 7
+# generators (sqlmap / selenium_bot / puppeteer_bot) are listed here too
+# so eval still computes y correctly even if the proxy somehow dropped
+# the X-Allm-Class header.
+AGENT_LABELS = frozenset({
+    "playwright_bot", "pentesterpro",
+    "sqlmap", "selenium_bot", "puppeteer_bot",
+})
+BENIGN_BOT_LABELS = frozenset({
+    "googlebot", "uptime_monitor", "rss_reader",
+    "link_unfurler", "ci_health_check",
+})
+HUMAN_LABELS = frozenset({"human_sim", "human_real"})
+
 HONEYPOT_NAMES = ("canary", "invisible_field", "admin_secrets", "robots_read")
+
+
+def derive_class_from_label(src_label: str) -> str:
+    """Legacy mapping for rows that pre-date the X-Allm-Class header."""
+    if src_label in AGENT_LABELS:
+        return "agent"
+    if src_label in BENIGN_BOT_LABELS:
+        return "benign_bot"
+    if src_label in HUMAN_LABELS:
+        return "human"
+    return "unknown"
 
 F_REQ = 9
 F_SESS = 12
@@ -46,6 +73,12 @@ class Session:
     duration_s: float
     ts_start: float
     n_req: int
+    # phase 6+ label-schema fields. Resolved at build time from row
+    # columns; for pre-phase-6 rows these are derived from src_label via
+    # derive_class_from_label() so eval code doesn't need per-row guards.
+    klass: str = "unknown"
+    family: str = ""
+    target_app: str = "dvwa"
 
 
 def _safe_log1p(x: float) -> float:
@@ -181,10 +214,22 @@ def load_jsonl(path: pathlib.Path) -> list[dict]:
     return rows
 
 
+def _majority_str(values) -> str:
+    """Most-common non-empty value, "" if there isn't one."""
+    counts: dict[str, int] = {}
+    for v in values:
+        if v:
+            counts[v] = counts.get(v, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
 def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Session]:
     reqs = load_jsonl(data_dir / "requests.jsonl")
     beacons = load_jsonl(data_dir / "beacons.jsonl")
     trips = load_jsonl(data_dir / "honeypots.jsonl")
+    sess_meta = load_jsonl(data_dir / "sessions.jsonl")
 
     by_sid_reqs: dict[str, list[dict]] = {}
     by_sid_bcn: dict[str, list[dict]] = {}
@@ -208,6 +253,15 @@ def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Sessio
             by_sid_trip.setdefault(sid, []).append(t)
             sid_label.setdefault(sid, t.get("src_label", "unknown"))
 
+    # sessions.jsonl is the authoritative source for the new label
+    # schema when present. Latest row per session_id wins (the proxy
+    # currently writes once per session, but be defensive).
+    sid_meta: dict[str, dict] = {}
+    for row in sess_meta:
+        sid = row.get("session_id")
+        if sid:
+            sid_meta[sid] = row
+
     sessions: list[Session] = []
     for sid, rs in by_sid_reqs.items():
         if len(rs) < min_requests:
@@ -217,7 +271,34 @@ def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Sessio
         agg, dur, ts0 = _agg_features(rs, by_sid_bcn.get(sid, []))
         hp = _hp_features(by_sid_trip.get(sid, []))
         label = sid_label.get(sid, "unknown")
-        y = 1 if label in AGENT_LABELS else 0
+
+        # Resolve the new label schema. Priority:
+        #   1. sessions.jsonl row (phase 6+ provenance manifest).
+        #   2. Majority value across the session's request rows
+        #      (phase 6+ requests.jsonl rows carry class/family/etc).
+        #   3. Legacy derivation from src_label.
+        meta = sid_meta.get(sid)
+        klass = ""
+        family = ""
+        target_app = ""
+        if meta:
+            klass = meta.get("class", "") or ""
+            family = meta.get("family", "") or ""
+            target_app = meta.get("target_app", "") or ""
+        if not klass:
+            klass = _majority_str(r.get("class") for r in rs)
+        if not family:
+            family = _majority_str(r.get("family") for r in rs)
+        if not target_app:
+            target_app = _majority_str(r.get("target_app") for r in rs)
+        if not klass:
+            klass = derive_class_from_label(label)
+        if not family:
+            family = label
+        if not target_app:
+            target_app = "dvwa"
+
+        y = 1 if klass == "agent" else 0
         sessions.append(
             Session(
                 session_id=sid,
@@ -229,6 +310,9 @@ def build_sessions(data_dir: pathlib.Path, min_requests: int = 3) -> list[Sessio
                 duration_s=dur,
                 ts_start=ts0,
                 n_req=len(rs),
+                klass=klass,
+                family=family,
+                target_app=target_app,
             )
         )
     sessions.sort(key=lambda s: s.ts_start)

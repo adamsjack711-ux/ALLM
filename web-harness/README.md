@@ -24,6 +24,7 @@ pointed at DVWA at security levels low → high.
 | 5 | PentesterPro-flavored agent + orchestrator + held-out-attacker eval | ✅ |
 | 6 | benign_bot family + per-session provenance manifest + label-schema columns | ✅ |
 | 7 | Multi-target (Juice Shop / WebGoat / VAmPI) + sqlmap / Selenium / Puppeteer agents | ✅ |
+| 8 | Detector eval rollup: per-family / per-target_app / agent-vs-benign_bot + held-out family | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -77,6 +78,9 @@ python3 tests/phase7_smoke.py
 # or run the new targets + extended agents by hand:
 docker compose --profile multitarget up -d --build         # juice shop / webgoat / vampi + their captures
 docker compose --profile attack-extended up -d --build     # sqlmap / selenium / puppeteer
+
+# Phase 8: detector eval rollup (per-family / per-target_app / agent-vs-benign_bot)
+python3 tests/phase8_smoke.py                              # synth-fed, no docker, ~10s
 ```
 
 Each `phase{N}_smoke.py` rebuilds whatever needs rebuilding, generates
@@ -412,17 +416,78 @@ detector eval in phase 8 has sessions to slice by both axes.
 
 ### What phase 7 explicitly does not do
 
-- nikto, ffuf, raw httpx / Scrapy generators. Phase 8.
-- Real OpenAI- / Gemini-backed PentesterPro (still mocked). Phase 8.
+- nikto, ffuf, raw httpx / Scrapy generators. Phase 9.
+- Real OpenAI- / Gemini-backed PentesterPro (still mocked). Phase 9.
 - Stealth variants (timing jitter, simulated mouse, human-speed
-  throttle, honeypot-avoidant). Phase 8 — the `stealth=true` axis
+  throttle, honeypot-avoidant). Phase 9 — the `stealth=true` axis
   is already a manifest field.
-- Detector eval that consumes the new `target_app` / `family` axes
-  (per-family recall, agent-vs-benign_bot confusion, held-out family).
-  Phase 8.
+- Detector eval that consumes the new `target_app` / `family` axes.
+  **Phase 8 ships this** (see below).
 - crAPI as a fourth target. VAmPI covers the no-DOM API case for
   phase 7; crAPI is heavier (Docker Compose with several services)
   and lands in phase 9 if needed.
+
+## Phase 8 — detector eval rollup
+
+Phase 6 widened the per-row label schema; phase 7 finally exercised
+it with multi-target + 3 new agent families. Phase 8 makes the
+detector eval consume it.
+
+### What `eval.py` now reports per head
+
+Existing (back-compat preserved):
+- `pr_auc`, `fp_per_hour`, `threshold`, `per_source` (keyed on
+  legacy `src_label`), `pr_curve_sample`, `alerter` metrics.
+
+New blocks:
+
+| key | shape | what it answers |
+|---|---|---|
+| `per_family` | `{family: {test_sessions, alerts, alert_rate, kind, recall_if_agent, fp_rate_if_benign}}` | Per the resolved provenance family. `kind` ∈ `{agent, benign_bot, human, unknown}` so consumers don't have to guess. |
+| `per_target_app` | `{app: {test_sessions, alerts, alert_rate, n_agent_truth, n_benign_truth}}` | Multi-target slice — does the detector behave differently on DVWA vs juice_shop vs vampi (no-DOM)? |
+| `agent_vs_benign_bot` | `{n_agent_truth, n_benign_bot_truth, agent_recall, benign_bot_fp_rate, confusion{2×2}, per_benign_family_fp}` | The load-bearing question once benign automation is in the data: can we alert on agents without flagging Googlebot / uptime monitors / RSS readers? |
+
+`ml_only` (the "honeypots-disabled run") gets the same blocks — that's
+the spec's "honeypots-disabled run" reported alongside.
+
+### What `heldout.py` now does
+
+Replaces the phase-5 held-out-attacker scan with a held-out-FAMILY
+scan over the resolved `family` axis, run on BOTH directions:
+
+- **Agent side** (existing semantics, broader scope): for each agent
+  family present, retrain without it, score the held-out sessions,
+  compare recall to in-distribution. `overfits_attacker` if
+  held-out recall < 0.5 × in-distribution.
+- **Benign_bot side** (new): for each benign_bot family present,
+  retrain without it, score the held-out sessions, compare false-
+  positive rate to in-distribution. `fp_generalization_fail` if
+  held-out FP rate > 2 × in-distribution. This catches "the detector
+  flags any non-Chrome UA it didn't see at training time" failure
+  modes — the symmetric concern to attacker overfit.
+
+### Back-compat with pre-phase-6 data
+
+`features.build_sessions` resolves `class / family / target_app` in
+priority order:
+1. The row in `sessions.jsonl` (phase 6+ provenance manifest).
+2. The majority value across the session's `requests.jsonl` rows.
+3. A legacy derivation from `src_label` (mirrors the proxy's
+   `_LEGACY_SRC_TO_LABEL` map).
+
+So phase-5 runs that pre-date the schema migration still parse: their
+sessions get `class = "agent"` / `"human"` based on the hardcoded
+`AGENT_LABELS` / `HUMAN_LABELS` sets in `features.py`, and the new
+eval blocks degrade to whatever signal those labels carry.
+
+### What phase 8 explicitly does not do
+
+- Wire the new blocks into the orchestrator / phase 5 smoke. Existing
+  phase 5 already asserts on the legacy `per_source` block; that
+  still works. The new blocks are produced, just not gate-asserted
+  there. `tests/phase8_smoke.py` asserts the new blocks directly.
+- Stealth variants of generators, real-LLM PentesterPro, more
+  scanners (nikto / ffuf / Scrapy). Phase 9.
 
 ## Out of scope
 

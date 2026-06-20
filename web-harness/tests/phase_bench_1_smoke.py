@@ -36,6 +36,7 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -352,67 +353,56 @@ def _check_sessions_has_both_classes() -> None:
         )
 
 
-# Built into the smoke (not derived from a third-party scanner) so it
-# runs offline in CI without extra deps. Catches the typical leak shapes
-# the user explicitly called out: api-key prefixes AND any literal value
-# of the two env vars at test time.
-_KEY_SUBSTRINGS = ("sk-live-", "sk-ant-", "sk-proj-", "sk-test-")
+# Real keys take the shape `sk-<scope>-<random>` where `random` is at
+# least ~16 alnum chars. Restricting the regex to prefix + ≥16 chars
+# avoids false-positives on README / .env.example / smoke mentions of
+# the bare prefix (which is the only sensible thing to write in docs).
+_KEY_REGEX = re.compile(
+    r"sk-(?:live|ant|proj|test|or)-[A-Za-z0-9_]{16,}"
+)
 
 
 def _check_no_secret_leak() -> None:
-    """Grep the worktree + data/ for known secret shapes."""
+    """Grep the worktree + data/ for known secret shapes.
+
+    Two layers: a regex that matches the *shape* of a real API key
+    (prefix + long alnum body) and an exact match against any value
+    of OPENAI_API_KEY / ANTHROPIC_API_KEY present in the test env.
+    """
     leaked: list[str] = []
-    repo_root = ROOT  # web-harness/ — narrower than the whole Cernis repo
-    # Skip the smoke itself: it contains the bogus `sk-test-DO-NOT-USE`
-    # literal on purpose, and that would create a false positive that's
-    # impossible to scrub.
-    skip = {
-        repo_root / "tests" / "phase_bench_1_smoke.py",
-    }
+    repo_root = ROOT
     runtime_secrets = [
         os.environ.get(k, "") for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
     ]
     runtime_secrets = [s for s in runtime_secrets if s and len(s) >= 16]
 
+    def _scan(p: pathlib.Path) -> None:
+        try:
+            text = p.read_text(errors="ignore")
+        except Exception:
+            return
+        if _KEY_REGEX.search(text):
+            leaked.append(f"{p}: matches key-shape regex")
+        for secret in runtime_secrets:
+            if secret in text:
+                leaked.append(f"{p}: matches live env-var value")
+
+    # Walk the worktree — skip heavy / binary / vendored / virtualenv dirs.
+    skip_parts = {"__pycache__", "node_modules", ".git", ".venv", "venv"}
     for path in repo_root.rglob("*"):
         if not path.is_file():
             continue
-        if path in skip:
+        if set(path.parts) & skip_parts:
             continue
-        # Skip obvious binary / heavy paths
-        if any(p in path.parts for p in (
-            "__pycache__", "node_modules", ".git", "data",
-        )) and path.parts[path.parts.index("data") if "data" in path.parts else 0] != "data":
-            # …unless we're explicitly scanning data/ below.
-            continue
-        try:
-            text = path.read_text(errors="ignore")
-        except Exception:
-            continue
-        for needle in _KEY_SUBSTRINGS:
-            if needle in text:
-                leaked.append(f"{path}: prefix {needle!r}")
-        for secret in runtime_secrets:
-            if secret in text:
-                leaked.append(f"{path}: live key value")
+        _scan(path)
 
     # Also walk data/ even though it's gitignored — capture writers
     # could persist a key if they were buggy.
     data_root = repo_root / "data"
     if data_root.exists():
         for path in data_root.rglob("*"):
-            if not path.is_file():
-                continue
-            try:
-                text = path.read_text(errors="ignore")
-            except Exception:
-                continue
-            for needle in _KEY_SUBSTRINGS:
-                if needle in text:
-                    leaked.append(f"{path}: prefix {needle!r}")
-            for secret in runtime_secrets:
-                if secret in text:
-                    leaked.append(f"{path}: live key value")
+            if path.is_file():
+                _scan(path)
 
     _assert(
         not leaked,

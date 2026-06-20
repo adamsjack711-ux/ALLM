@@ -30,12 +30,18 @@ PART C — baselines (commit 3)
 
 from __future__ import annotations
 
+import filecmp
 import json
 import pathlib
+import random
 import sys
+import tempfile
+
+import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "detector"))
 
 from benchmark import splits as splitmod  # noqa: E402
 
@@ -181,13 +187,221 @@ def _run_part_a() -> None:
     print("[phase-bench-2] PART A passed (splits: determinism + disjointness + checksum)")
 
 
+# ── PART B: submission contract + evaluate harness ───────────────────
+
+
+def _synth_feature_sessions(seed: int = 0):
+    """Build synthetic `features.Session` objects directly — no JSONL
+    on disk, no detector.features.build_sessions invocation. The eval
+    harness accepts this list via its `sessions` parameter so the smoke
+    stays fast and self-contained.
+    """
+    from features import F_HP, F_REQ, F_SESS, Session  # type: ignore
+    rng = random.Random(seed)
+    nprng = np.random.default_rng(seed)
+    out: list[Session] = []
+    agent_families = ["playwright_bot", "selenium_bot", "sqlmap", "puppeteer_bot"]
+    stealth_capable = {"playwright_bot", "selenium_bot"}
+    counter = 0
+    for fam in agent_families:
+        for i in range(6):
+            stealth = i >= 3 and fam in stealth_capable
+            counter += 1
+            t = 8 + i  # T (n_req) per session
+            # Agent rows: low cadence + high path-breadth + tool-shaped agg.
+            agg = nprng.normal(loc=2.0, scale=0.3, size=F_SESS).astype(np.float32)
+            seq = nprng.normal(loc=1.2, scale=0.4, size=(t, F_REQ)).astype(np.float32)
+            hp = np.zeros(F_HP, dtype=np.float32)
+            if rng.random() < 0.4:
+                hp[rng.randint(0, F_HP - 1)] = 1.0
+            out.append(Session(
+                session_id=f"{fam}-{i:02d}",
+                src_label=fam,
+                seq=seq, agg=agg, hp=hp,
+                y=1, duration_s=60.0 + i,
+                ts_start=1.0 * counter, n_req=t,
+                klass="agent", family=fam, target_app="dvwa",
+                stealth=stealth,
+            ))
+    for fam in ("googlebot", "uptime_monitor", "rss_reader"):
+        for i in range(6):
+            counter += 1
+            t = 5 + i
+            agg = nprng.normal(loc=0.0, scale=0.5, size=F_SESS).astype(np.float32)
+            seq = nprng.normal(loc=0.0, scale=0.6, size=(t, F_REQ)).astype(np.float32)
+            hp = np.zeros(F_HP, dtype=np.float32)
+            out.append(Session(
+                session_id=f"{fam}-{i:02d}",
+                src_label=fam,
+                seq=seq, agg=agg, hp=hp,
+                y=0, duration_s=120.0 + i,
+                ts_start=1.0 * counter, n_req=t,
+                klass="benign_bot", family=fam, target_app="dvwa",
+                stealth=False,
+            ))
+    for i in range(10):
+        counter += 1
+        t = 6 + i
+        agg = nprng.normal(loc=-1.0, scale=0.4, size=F_SESS).astype(np.float32)
+        seq = nprng.normal(loc=-0.5, scale=0.5, size=(t, F_REQ)).astype(np.float32)
+        hp = np.zeros(F_HP, dtype=np.float32)
+        out.append(Session(
+            session_id=f"human-{i:02d}",
+            src_label="human_real",
+            seq=seq, agg=agg, hp=hp,
+            y=0, duration_s=300.0 + i,
+            ts_start=1.0 * counter, n_req=t,
+            klass="human", family="human_real", target_app="dvwa",
+            stealth=False,
+        ))
+    return out
+
+
+_STUB_SUBMISSION = '''"""Inline stub submission for the phase-bench-2 smoke.
+
+Always returns 0.5 for every session — sanity-checks the harness
+plumbing without testing real model quality.
+"""
+
+def predict(features):
+    return [{"session_id": f["session_id"], "agent_score": 0.5} for f in features]
+'''
+
+
+def _write_stub_submission(dest: pathlib.Path) -> pathlib.Path:
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "submission.py").write_text(_STUB_SUBMISSION)
+    return dest
+
+
+def _run_part_b() -> None:
+    from benchmark import build_splits as bsmod  # noqa: PLC0415
+    from benchmark import evaluate as evalmod  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        splits_dir = td / "splits" / splitmod.SPLITS_VERSION
+        sessions = _synth_feature_sessions(seed=0)
+
+        # Build splits from the synth session metas.
+        metas = bsmod.sessions_to_meta(sessions)
+        split_set = splitmod.build_split_set(
+            metas, seed=0,
+            source_data_sha256="synth-smoke",
+        )
+        splitmod.assert_family_disjoint(split_set)
+        splitmod.write_split_set(split_set, splits_dir)
+
+        # (B1) Public-eval refuses to open private_*.json under SPLIT=public_test.
+        try:
+            evalmod._safe_load_split(splits_dir, "private_heldout_family", "public_test")
+        except PermissionError as exc:
+            _assert(
+                "refusing to load" in str(exc),
+                f"[phase-bench-2] PermissionError wording changed: {exc}",
+            )
+        else:
+            raise AssertionError(
+                "[phase-bench-2] public_test eval allowed loading private_heldout_family"
+            )
+
+        # (B2) Stub submission end-to-end on public_test.
+        submission_dir = _write_stub_submission(td / "stub_submission")
+        out_dir_1 = td / "eval_run_1"
+        out_dir_2 = td / "eval_run_2"
+        results_1 = evalmod.run_eval(
+            submission_dir=submission_dir,
+            split="public_test",
+            splits_dir=splits_dir,
+            data_dir=td / "data",  # unused — sessions injected below
+            seed=0,
+            fp_per_hour_budget=1.0,
+            out_dir=out_dir_1,
+            sessions=sessions,
+        )
+        for key in ("split", "seed", "primary", "per_family",
+                     "per_target_app", "agent_vs_benign_bot",
+                     "n_sessions", "session_hours", "fp_per_hour_budget"):
+            _assert(
+                key in results_1,
+                f"[phase-bench-2] results missing key {key!r}",
+            )
+        _assert(
+            "pr_auc" in results_1["primary"],
+            "[phase-bench-2] primary missing pr_auc",
+        )
+        _assert(
+            (out_dir_1 / "results.json").exists()
+            and (out_dir_1 / "report.txt").exists(),
+            "[phase-bench-2] evaluate did not write results.json + report.txt",
+        )
+
+        # (B3) Reproducibility: same submission, same seed → byte-identical
+        # results.json.
+        evalmod.run_eval(
+            submission_dir=submission_dir,
+            split="public_test",
+            splits_dir=splits_dir,
+            data_dir=td / "data",
+            seed=0,
+            fp_per_hour_budget=1.0,
+            out_dir=out_dir_2,
+            sessions=sessions,
+        )
+        _assert(
+            filecmp.cmp(
+                out_dir_1 / "results.json", out_dir_2 / "results.json",
+                shallow=False,
+            ),
+            "[phase-bench-2] two same-seed runs produced different results.json "
+            "(reproducibility broken)",
+        )
+
+        # (B4) No `accuracy` substring anywhere in results.json or report.txt.
+        for name in ("results.json", "report.txt"):
+            text = (out_dir_1 / name).read_text().lower()
+            _assert(
+                "accuracy" not in text,
+                f"[phase-bench-2] forbidden 'accuracy' substring found in {name}",
+            )
+
+        # (B5) Heldout SPLIT also runs end-to-end and emits the extra
+        # primary fields (heldout_family_pr_auc + recalls).
+        out_dir_h = td / "eval_run_heldout"
+        results_h = evalmod.run_eval(
+            submission_dir=submission_dir,
+            split="heldout",
+            splits_dir=splits_dir,
+            data_dir=td / "data",
+            seed=0,
+            fp_per_hour_budget=1.0,
+            out_dir=out_dir_h,
+            sessions=sessions,
+        )
+        for key in (
+            "heldout_family_pr_auc",
+            "heldout_family_recall_at_budget",
+            "heldout_stealth_recall",
+        ):
+            _assert(
+                key in results_h["primary"],
+                f"[phase-bench-2] heldout primary missing {key!r}",
+            )
+
+    print(
+        "[phase-bench-2] PART B passed (evaluate harness: contract + "
+        "private-split protection + reproducibility + no-accuracy)"
+    )
+
+
 # ── runner ───────────────────────────────────────────────────────────
 
 
 def main() -> int:
     print("[phase-bench-2] running smoke (offline, no docker)…")
     _run_part_a()
-    # PART B (evaluate) and PART C (baselines) land in commits 2 + 3.
+    _run_part_b()
+    # PART C (baselines) lands in commit 3.
     print("[phase-bench-2] OK")
     return 0
 

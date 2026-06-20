@@ -17,10 +17,10 @@ COPY puppeteer_bot /app/puppeteer_bot
 
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    ALLM_TARGET=http://capture:8080 \
+    CERNIS_TARGET=http://capture:8080 \
     PYTHONUNBUFFERED=1 \
     NODE_ENV=production
 
 # Re-use the python target_guard as an entrypoint pre-check, then exec node.
-# Any non-loopback / non-allowlisted ALLM_TARGET hard-exits before node starts.
+# Any non-loopback / non-allowlisted CERNIS_TARGET hard-exits before node starts.
 CMD ["sh", "-c", "python3 /app/shared/target_guard.py && exec node /app/puppeteer_bot/bot.js"]

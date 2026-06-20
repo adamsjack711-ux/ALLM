@@ -1,6 +1,6 @@
 """Dispatcher for the benign_bot generator family.
 
-Reads `ALLM_BENIGN_BOT` from env and runs one of:
+Reads `CERNIS_BENIGN_BOT` from env and runs one of:
   - googlebot    : crawler that obeys robots.txt and walks Disallow paths
   - uptime       : HEAD+GET / on a fixed cadence
   - rss          : periodic GETs of feed paths
@@ -9,9 +9,9 @@ Reads `ALLM_BENIGN_BOT` from env and runs one of:
 
 Each one:
   1. starts a session against the capture proxy,
-  2. POSTs one provenance row keyed on its allm_sid cookie,
-  3. sets the X-Allm-* label-schema headers on every request,
-  4. loops `ALLM_SESSIONS` times.
+  2. POSTs one provenance row keyed on its cernis_sid cookie,
+  3. sets the X-Cernis-* label-schema headers on every request,
+  4. loops `CERNIS_SESSIONS` times.
 
 These are all non-browser HTTP clients (no JS execution), which is the
 honest fingerprint for these benign-bot families in the wild — the
@@ -46,16 +46,16 @@ BOTS = {
 
 
 def main() -> int:
-    name = os.environ.get("ALLM_BENIGN_BOT", "").strip().lower()
+    name = os.environ.get("CERNIS_BENIGN_BOT", "").strip().lower()
     if name not in BOTS:
         print(
-            f"[benign_bots] ALLM_BENIGN_BOT must be one of {sorted(BOTS)}, "
+            f"[benign_bots] CERNIS_BENIGN_BOT must be one of {sorted(BOTS)}, "
             f"got {name!r}",
             file=sys.stderr,
         )
         return 2
     target = get_target()
-    sessions = int(os.environ.get("ALLM_SESSIONS", "5"))
+    sessions = int(os.environ.get("CERNIS_SESSIONS", "5"))
     print(f"[benign_bots] family={name} target={target} sessions={sessions}", flush=True)
     bot = BOTS[name]
     for i in range(sessions):

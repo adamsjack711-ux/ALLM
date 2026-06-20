@@ -1,13 +1,13 @@
 """Shared bootstrap for benign_bot families.
 
 Every family follows the same shape:
-  - open a fresh httpx.Client (= new allm_sid cookie when the proxy
+  - open a fresh httpx.Client (= new cernis_sid cookie when the proxy
     mints one on the first request),
   - make one trivial GET to materialize the cookie,
   - POST /__provenance with the family's labels + config,
   - run the family's traffic pattern.
 
-The bots are intentionally non-stealthy: their User-Agent and X-Allm-*
+The bots are intentionally non-stealthy: their User-Agent and X-Cernis-*
 headers truthfully identify what they are. Stealth variants land in
 phase 2 (and set stealth=true in the manifest).
 """
@@ -58,7 +58,7 @@ def start_session(
         timeout=10.0,
         follow_redirects=False,
     )
-    # Materialize the allm_sid cookie before the provenance POST so the
+    # Materialize the cernis_sid cookie before the provenance POST so the
     # proxy can key it correctly. A HEAD on / is the cheapest path.
     try:
         client.head("/")

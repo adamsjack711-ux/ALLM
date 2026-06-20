@@ -12,7 +12,7 @@ What this DOES NOT do (load-bearing for "safe for prod"):
   - NO honeypot injection — `/__canary` / invisible fields / hidden DOM
     notices belong in the lab, not on a live site.
   - NO JS beacon — we never modify response bodies.
-  - NO cookie minting — the lab's `allm_sid` cookie is a lab artifact;
+  - NO cookie minting — the lab's `cernis_sid` cookie is a lab artifact;
     real users have their own session cookies, untouched.
   - NO authorization-header capture — the shipper reads the access log
     only, never the request body or any sensitive header values.

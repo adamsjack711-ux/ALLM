@@ -1,4 +1,4 @@
-"""Capture reverse proxy for the allm-web-harness lab.
+"""Capture reverse proxy for the cernis-web-harness lab.
 
 Sits between traffic generators and DVWA. Phase 3 adds a honeypot layer
 (see honeypots.py). All session+log plumbing now lives in a middleware
@@ -6,7 +6,7 @@ so honeypot routes share it with the proxied traffic.
 
 For each request the middleware:
   - reads the body once, stashes it on `request['_body_in']`
-  - mints / re-uses an `allm_sid` session cookie
+  - mints / re-uses an `cernis_sid` session cookie
   - resolves the source label (header on :8080, hard-coded on :8090)
   - runs the form-POST honeypot check before any forwarding
   - on response, sets the session cookie if new and writes one redacted
@@ -33,11 +33,11 @@ from aiohttp import web
 import honeypots
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://dvwa:80").rstrip("/")
-# Each capture container fronts one target. ALLM_TARGET_APP is the
+# Each capture container fronts one target. CERNIS_TARGET_APP is the
 # label that flows into the per-row `target_app` column when the
-# generator didn't set X-Allm-TargetApp itself (e.g. human_real
+# generator didn't set X-Cernis-TargetApp itself (e.g. human_real
 # browsing, or legacy generators).
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa")
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa")
 DATA_DIR = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REQ_LOG = DATA_DIR / "requests.jsonl"
@@ -48,7 +48,7 @@ BEACON_JS = pathlib.Path(__file__).with_name("beacon.js").read_bytes()
 TELEMETRY_PATHS = ("/__beacon.js", "/__beacon", "/__provenance")
 
 # Back-compat mapping: existing generators (phases 1-5) only set
-# X-Allm-Source. Derive class/family for them so eval code can group by
+# X-Cernis-Source. Derive class/family for them so eval code can group by
 # the new label-schema axes without per-row guards.
 _LEGACY_SRC_TO_LABEL: dict[str, tuple[str, str]] = {
     "playwright_bot": ("agent", "playwright_bot"),
@@ -81,7 +81,7 @@ def make_session_id() -> str:
 
 
 def get_or_mint_sid(request: web.Request) -> tuple[str, bool]:
-    sid = request.cookies.get("allm_sid")
+    sid = request.cookies.get("cernis_sid")
     if sid and len(sid) >= 16:
         return sid, False
     return make_session_id(), True
@@ -109,34 +109,34 @@ async def write_session_log(row: dict) -> None:
 
 
 def _label_schema_from_request(request: web.Request, src_label: str) -> dict:
-    """Pull the X-Allm-* label-schema headers off a request.
+    """Pull the X-Cernis-* label-schema headers off a request.
 
     Falls back to deriving class/family from src_label for legacy
-    generators (phases 1-5) that only set X-Allm-Source. The fallback
+    generators (phases 1-5) that only set X-Cernis-Source. The fallback
     target_app stays "dvwa" because phase 1 is DVWA-only; this constant
     moves to a header lookup in phase 2 when multi-target lands.
     """
-    cls = request.headers.get("X-Allm-Class")
-    fam = request.headers.get("X-Allm-Family")
+    cls = request.headers.get("X-Cernis-Class")
+    fam = request.headers.get("X-Cernis-Family")
     if cls is None or fam is None:
         derived = _LEGACY_SRC_TO_LABEL.get(src_label)
         if derived is not None:
             cls = cls or derived[0]
             fam = fam or derived[1]
-    stealth_raw = request.headers.get("X-Allm-Stealth", "").lower()
+    stealth_raw = request.headers.get("X-Cernis-Stealth", "").lower()
     return {
         "class": cls or "unknown",
         "family": fam or src_label,
-        "target_app": request.headers.get("X-Allm-TargetApp", TARGET_APP),
-        "security_level": request.headers.get("X-Allm-SecurityLevel", "na"),
+        "target_app": request.headers.get("X-Cernis-TargetApp", TARGET_APP),
+        "security_level": request.headers.get("X-Cernis-SecurityLevel", "na"),
         "stealth": stealth_raw in ("1", "true", "yes"),
     }
 
 
-def _has_allm_label_headers(request: web.Request) -> bool:
-    """True if the request explicitly carries any X-Allm-* label header."""
+def _has_cernis_label_headers(request: web.Request) -> bool:
+    """True if the request explicitly carries any X-Cernis-* label header."""
     for k in request.headers.keys():
-        if k.lower().startswith("x-allm-"):
+        if k.lower().startswith("x-cernis-"):
             return True
     return False
 
@@ -147,7 +147,7 @@ async def session_and_log_middleware(request: web.Request, handler):
     body_in = await request.read()
     sid, is_new = get_or_mint_sid(request)
     label = request.app["label_for"](request)
-    # phase 11: if this request didn't carry an X-Allm-Source but an
+    # phase 11: if this request didn't carry an X-Cernis-Source but an
     # earlier request on the same session did, inherit it. Tools like
     # nikto that can't set per-request headers bootstrap with a labeled
     # session and then scan; the cache keeps the proxy's per-row labels
@@ -156,7 +156,7 @@ async def session_and_log_middleware(request: web.Request, handler):
         cached_label = _session_src_label_cache.get(sid)
         if cached_label:
             label = cached_label
-    elif label not in ("", "unknown") and _has_allm_label_headers(request):
+    elif label not in ("", "unknown") and _has_cernis_label_headers(request):
         _session_src_label_cache[sid] = label
     request["_body_in"] = body_in
     request["_sid"] = sid
@@ -170,8 +170,8 @@ async def session_and_log_middleware(request: web.Request, handler):
     except web.HTTPException as exc:
         resp = exc
 
-    if is_new and not resp.cookies.get("allm_sid"):
-        resp.set_cookie("allm_sid", sid, httponly=True, path="/", samesite="Lax")
+    if is_new and not resp.cookies.get("cernis_sid"):
+        resp.set_cookie("cernis_sid", sid, httponly=True, path="/", samesite="Lax")
 
     if request.path in TELEMETRY_PATHS:
         return resp
@@ -191,10 +191,10 @@ async def session_and_log_middleware(request: web.Request, handler):
 
     # Schema cache: first time we see an explicitly-labeled request on
     # this sid, write the schema into the cache. Subsequent requests on
-    # the same sid that DIDN'T set their own X-Allm-* headers inherit
+    # the same sid that DIDN'T set their own X-Cernis-* headers inherit
     # the cached schema so the per-row class/family/target_app stays
     # consistent across the session.
-    if _has_allm_label_headers(request):
+    if _has_cernis_label_headers(request):
         schema = _label_schema_from_request(request, label)
         _session_schema_cache.setdefault(sid, schema)
     else:
@@ -344,9 +344,9 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     fwd_headers["X-Forwarded-For"] = request.remote or ""
     fwd_headers["X-Forwarded-Proto"] = "http"
     if is_new and "Cookie" not in fwd_headers:
-        fwd_headers["Cookie"] = f"allm_sid={sid}"
+        fwd_headers["Cookie"] = f"cernis_sid={sid}"
     elif is_new:
-        fwd_headers["Cookie"] = fwd_headers["Cookie"] + f"; allm_sid={sid}"
+        fwd_headers["Cookie"] = fwd_headers["Cookie"] + f"; cernis_sid={sid}"
 
     client = request.app["client"]
     try:
@@ -389,7 +389,7 @@ def make_app(*, label: Optional[str], default_from_header: bool) -> web.Applicat
     def label_for(request: web.Request) -> str:
         if label is not None:
             return label
-        return request.headers.get("X-Allm-Source", "unknown")
+        return request.headers.get("X-Cernis-Source", "unknown")
 
     app["label_for"] = label_for
     app["honeypot"] = honeypots.HoneypotLayer(DATA_DIR)

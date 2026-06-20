@@ -13,7 +13,7 @@ Key properties for the detector:
     for the no-DOM-target class.
   - sqlmap's per-request cadence is machine-fast and structurally
     repetitive — distinct shape from Playwright and Puppeteer.
-  - the X-Allm-* labels travel on every request via the `-H` flag, so
+  - the X-Cernis-* labels travel on every request via the `-H` flag, so
     the proxy still keys class / family / target_app correctly.
 
 Provenance is registered by the wrapper (sqlmap itself doesn't speak
@@ -35,13 +35,13 @@ from target_guard import get_target  # noqa: E402
 
 LABEL = "sqlmap"
 TARGET = get_target()
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa").strip().lower()
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa").strip().lower()
 SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "2"))
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "2"))
 DVWA_USER = os.environ.get("DVWA_USER", "admin")
 DVWA_PASS = os.environ.get("DVWA_PASS", "password")
 SQLMAP_TIMEOUT_S = int(os.environ.get("SQLMAP_TIMEOUT_S", "300"))
-STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
     "1", "true", "yes",
 )
 # Stealth knobs: real-browser UA, --delay 3 between requests (sub-machine-
@@ -144,7 +144,7 @@ def run_session(i: int) -> int:
         base_url=TARGET, headers=request_headers,
         timeout=15.0, follow_redirects=False,
     ) as client:
-        # mint allm_sid + register provenance
+        # mint cernis_sid + register provenance
         try:
             client.head("/")
         except httpx.HTTPError as exc:
@@ -154,7 +154,7 @@ def run_session(i: int) -> int:
         if TARGET_APP == "dvwa":
             cookie_hdr = _dvwa_login_and_cookies(client)
         else:
-            # carry the allm_sid the proxy just minted so sqlmap's requests
+            # carry the cernis_sid the proxy just minted so sqlmap's requests
             # still land in the same session
             cookie_hdr = "; ".join(f"{k}={v}" for k, v in client.cookies.items())
 

@@ -22,7 +22,7 @@ loopback invariant.
 Wall-clock: building 3 new images (selenium incl chromium, puppeteer
 incl chromium, sqlmap incl git-cloned sqlmap repo) plus 3 vulnerable
 target containers (Juice Shop / WebGoat / VAmPI) takes a while on a
-cold cache. Crank `ALLM_PHASE7_WAIT_S` if your machine is slow.
+cold cache. Crank `CERNIS_PHASE7_WAIT_S` if your machine is slow.
 """
 
 from __future__ import annotations
@@ -44,13 +44,13 @@ SCHEMA_FIELDS = (
     "class", "family", "target_app", "security_level", "stealth",
     "generator", "generator_version", "generator_config_sha",
 )
-WAIT_BUDGET_S = int(os.environ.get("ALLM_PHASE7_WAIT_S", "600"))
+WAIT_BUDGET_S = int(os.environ.get("CERNIS_PHASE7_WAIT_S", "600"))
 
 # Targets each generator runs against this sweep. Generators read
-# ALLM_TARGET / ALLM_TARGET_APP at container start; we mutate compose
+# CERNIS_TARGET / CERNIS_TARGET_APP at container start; we mutate compose
 # env per family by passing them via `up`-time overrides.
 SWEEP = [
-    # (compose_service, ALLM_TARGET, ALLM_TARGET_APP)
+    # (compose_service, CERNIS_TARGET, CERNIS_TARGET_APP)
     ("sqlmap_bot",    "http://capture:8080",       "dvwa"),
     ("selenium_bot",  "http://capture:8080",       "dvwa"),
     ("puppeteer_bot", "http://capture:8080",       "dvwa"),
@@ -120,8 +120,8 @@ def main() -> None:
     for service, target, target_app in SWEEP:
         run(
             ["docker", "compose", "run", "--rm",
-             "-e", f"ALLM_TARGET={target}",
-             "-e", f"ALLM_TARGET_APP={target_app}",
+             "-e", f"CERNIS_TARGET={target}",
+             "-e", f"CERNIS_TARGET_APP={target_app}",
              "--profile", "attack-extended", service],
             check=False,  # sqlmap exits non-zero on no-injection, fine
         )

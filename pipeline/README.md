@@ -1,6 +1,6 @@
-# `pipeline/` — host telemetry → ALLM detector
+# `pipeline/` — host telemetry → CERNIS detector
 
-A real-data ingest path for the ALLM host detector. Takes Sysmon dumps
+A real-data ingest path for the CERNIS host detector. Takes Sysmon dumps
 from an authorized lab range, joins them against a CALDERA operation
 report to recover attack labels, normalizes via `adapter_winlogs`,
 windowizes (32 events, the same shape `detector_v0..v3` expect), runs

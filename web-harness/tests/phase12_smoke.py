@@ -55,8 +55,8 @@ def _check_compose() -> dict:
                 f"[phase12] {name} publishes ports — loopback invariant "
                 f"broken: {svc.get('ports')!r}")
         nets = svc.get("networks") or []
-        _assert("allm_lab" in nets,
-                f"[phase12] {name} not on allm_lab network: {nets!r}")
+        _assert("cernis_lab" in nets,
+                f"[phase12] {name} not on cernis_lab network: {nets!r}")
     return services
 
 

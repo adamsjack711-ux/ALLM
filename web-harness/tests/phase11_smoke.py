@@ -13,7 +13,7 @@ Three things to assert:
      ones (raw_httpx / ffuf / sqlmap — no DOM-needing families).
 
   3. The proxy schema cache logic in capture/proxy.py works: a session
-     that bootstraps with X-Allm-* headers + then issues unlabeled
+     that bootstraps with X-Cernis-* headers + then issues unlabeled
      requests still gets its rows tagged with the right class /
      family / target_app. Smoke synthesizes the proxy's cache logic
      directly (no docker) by exercising _label_schema_from_request
@@ -90,12 +90,12 @@ def _proxy_cache_check() -> bool:
 
     sid = "test-sid-phase11-cache"
     labeled = _FakeReq({
-        "X-Allm-Source": "nikto",
-        "X-Allm-Class":  "agent",
-        "X-Allm-Family": "nikto",
-        "X-Allm-TargetApp": "dvwa",
-        "X-Allm-SecurityLevel": "low",
-        "X-Allm-Stealth": "false",
+        "X-Cernis-Source": "nikto",
+        "X-Cernis-Class":  "agent",
+        "X-Cernis-Family": "nikto",
+        "X-Cernis-TargetApp": "dvwa",
+        "X-Cernis-SecurityLevel": "low",
+        "X-Cernis-Stealth": "false",
     })
     schema_first = proxy._label_schema_from_request(labeled, "nikto")
     proxy._session_schema_cache.setdefault(sid, schema_first)
@@ -106,11 +106,11 @@ def _proxy_cache_check() -> bool:
     _assert(schema_first["family"] == "nikto",
             f"[phase11] cache check first family={schema_first['family']}")
 
-    # second request: no X-Allm-* headers (nikto's scan probes)
+    # second request: no X-Cernis-* headers (nikto's scan probes)
     unlabeled = _FakeReq({"User-Agent": "nikto/2.5"})
-    has_label_headers = proxy._has_allm_label_headers(unlabeled)
+    has_label_headers = proxy._has_cernis_label_headers(unlabeled)
     _assert(not has_label_headers,
-            "[phase11] unlabeled request shouldn't carry X-Allm-* headers")
+            "[phase11] unlabeled request shouldn't carry X-Cernis-* headers")
 
     cached_schema = proxy._session_schema_cache.get(sid)
     _assert(cached_schema is not None, "[phase11] schema cache empty after first req")

@@ -23,7 +23,7 @@ SETUP = f"{TARGET}/setup.php"
 def main() -> int:
     jar = cj.CookieJar()
     opener = ur.build_opener(ur.HTTPCookieProcessor(jar))
-    opener.addheaders = [("User-Agent", "allm-init/1.0")]
+    opener.addheaders = [("User-Agent", "cernis-init/1.0")]
 
     end = time.time() + 60
     while time.time() < end:

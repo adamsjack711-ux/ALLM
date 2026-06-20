@@ -24,8 +24,8 @@ HON = ROOT / "data" / "honeypots.jsonl"
 BCN = ROOT / "data" / "beacons.jsonl"
 REPORT = ROOT / "data" / "reports" / "phase4.json"
 
-N_BOT = int(os.environ.get("ALLM_PHASE4_BOT", "12"))
-N_HUMAN = int(os.environ.get("ALLM_PHASE4_HUMAN", "12"))
+N_BOT = int(os.environ.get("CERNIS_PHASE4_BOT", "12"))
+N_HUMAN = int(os.environ.get("CERNIS_PHASE4_HUMAN", "12"))
 
 
 def run(cmd: list[str], check: bool = False) -> int:
@@ -53,12 +53,12 @@ def main() -> None:
     print(f"[phase4] generating {N_BOT} bot + {N_HUMAN} human sessions", flush=True)
     run([
         "docker", "compose", "--profile", "generators", "run", "--rm",
-        "-e", f"ALLM_SESSIONS={N_BOT}",
+        "-e", f"CERNIS_SESSIONS={N_BOT}",
         "playwright_bot",
     ], check=True)
     run([
         "docker", "compose", "--profile", "generators", "run", "--rm",
-        "-e", f"ALLM_SESSIONS={N_HUMAN}",
+        "-e", f"CERNIS_SESSIONS={N_HUMAN}",
         "human_sim",
     ], check=True)
     gen_elapsed = time.time() - t0

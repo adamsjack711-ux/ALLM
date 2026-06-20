@@ -7,10 +7,10 @@ characteristics differ in ways that show up in the per-request log
 (navigation timing, header set, fetch initiator) — that's the point.
 
 We use Chrome DevTools Protocol via `execute_cdp_cmd` to set the
-X-Allm-* labels as extra HTTP headers on every subsequent request, so
+X-Cernis-* labels as extra HTTP headers on every subsequent request, so
 the capture proxy keys the session correctly. Provenance is written
 via `fetch` from inside the browser, which inherits the same cookie
-jar (and therefore the same allm_sid the proxy minted on first nav).
+jar (and therefore the same cernis_sid the proxy minted on first nav).
 """
 
 from __future__ import annotations
@@ -37,12 +37,12 @@ from selenium.common.exceptions import (  # noqa: E402
 
 LABEL = "selenium_bot"
 TARGET = get_target()
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa").strip().lower()
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa").strip().lower()
 SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "3"))
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "3"))
 DVWA_USER = os.environ.get("DVWA_USER", "admin")
 DVWA_PASS = os.environ.get("DVWA_PASS", "password")
-STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
     "1", "true", "yes",
 )
 STEALTH_UA = (
@@ -77,7 +77,7 @@ def _make_driver(label_headers: dict) -> webdriver.Chrome:
         opts.add_argument(f"--user-agent={STEALTH_UA}")
     service = Service(os.environ.get("CHROMEDRIVER_BIN", "/usr/bin/chromedriver"))
     driver = webdriver.Chrome(service=service, options=opts)
-    # set X-Allm-* on every subsequent request via CDP
+    # set X-Cernis-* on every subsequent request via CDP
     driver.execute_cdp_cmd("Network.enable", {})
     driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": label_headers})
     return driver
@@ -105,7 +105,7 @@ def _is_visible_input(driver: webdriver.Chrome, inp) -> bool:
 
 
 def _record_provenance_in_browser(driver: webdriver.Chrome, payload: dict) -> None:
-    """POST /__provenance from inside the page so the allm_sid cookie travels."""
+    """POST /__provenance from inside the page so the cernis_sid cookie travels."""
     script = """
     const payload = arguments[0];
     const done = arguments[1];
@@ -186,7 +186,7 @@ def run_session(i: int) -> int:
     driver = _make_driver(label_headers)
     n_pages = 0
     try:
-        # nav to root first so the proxy mints allm_sid + provenance writes
+        # nav to root first so the proxy mints cernis_sid + provenance writes
         # into a real session
         driver.get(f"{TARGET}/")
         _record_provenance_in_browser(driver, payload)

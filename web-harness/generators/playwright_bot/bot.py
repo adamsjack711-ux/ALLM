@@ -1,13 +1,13 @@
 """Playwright agent — rapid, deterministic, no humanlike pauses.
 
-Each session = a fresh BrowserContext (= a new `allm_sid` cookie minted by
+Each session = a fresh BrowserContext (= a new `cernis_sid` cookie minted by
 the capture proxy). The bot logs in to DVWA, walks a fixed set of
 vulnerability categories, and sprays payloads from `payloads.txt` into
 the first text input on each page. No mouse jitter, no dwell.
 
-Every request carries `X-Allm-Source: playwright_bot`.
+Every request carries `X-Cernis-Source: playwright_bot`.
 
-Phase 9 stealth mode (ALLM_STEALTH=true): family stays the same, the
+Phase 9 stealth mode (CERNIS_STEALTH=true): family stays the same, the
 `stealth=true` axis on the manifest distinguishes the run. Stealth
 toggles ON:
   - random human-speed delays between actions (5-15s)
@@ -37,12 +37,12 @@ from playwright.async_api import async_playwright  # noqa: E402
 
 LABEL = "playwright_bot"
 TARGET = get_target()
-TARGET_APP = os.environ.get("ALLM_TARGET_APP", "dvwa")
+TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa")
 SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "10"))
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "10"))
 DVWA_USER = os.environ.get("DVWA_USER", "admin")
 DVWA_PASS = os.environ.get("DVWA_PASS", "password")
-STEALTH = os.environ.get("ALLM_STEALTH", "false").strip().lower() in (
+STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
     "1", "true", "yes",
 )
 STEALTH_UA = (

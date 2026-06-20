@@ -78,7 +78,7 @@ class SweepConfig:
         }
 
 
-# Maps target_app → {ALLM_TARGET URL, supported families}. Selenium and
+# Maps target_app → {CERNIS_TARGET URL, supported families}. Selenium and
 # Puppeteer drive browsers, which only makes sense against HTML targets;
 # VAmPI is JSON-only so we skip the browser families there. sqlmap,
 # playwright_bot, and the phase 11 scanner family run against everything
@@ -120,7 +120,7 @@ _FAMILY_SERVICES: dict[tuple[str, bool], str] = {
     ("selenium_bot",   True):  "selenium_bot_stealth",
     ("puppeteer_bot",  False): "puppeteer_bot",
     ("puppeteer_bot",  True):  "puppeteer_bot_stealth",
-    # phase 11 — scanner family (single image per family, ALLM_STEALTH
+    # phase 11 — scanner family (single image per family, CERNIS_STEALTH
     # picks the mode at run time, so no separate stealth service)
     ("raw_httpx",      False): "raw_httpx_bot",
     ("raw_httpx",      True):  "raw_httpx_bot",
@@ -215,11 +215,11 @@ def execute_sweep(plan: Iterable[SweepCell]) -> list[dict]:
         t0 = time.time()
         cmd = [
             "docker", "compose", "run", "--rm",
-            "-e", f"ALLM_TARGET={_target_url(cell.target_app)}",
-            "-e", f"ALLM_TARGET_APP={cell.target_app}",
+            "-e", f"CERNIS_TARGET={_target_url(cell.target_app)}",
+            "-e", f"CERNIS_TARGET_APP={cell.target_app}",
             "-e", f"DVWA_SECURITY_LEVEL={cell.security_level}",
-            "-e", f"ALLM_SESSIONS={cell.sessions}",
-            "-e", f"ALLM_STEALTH={'true' if cell.stealth else 'false'}",
+            "-e", f"CERNIS_SESSIONS={cell.sessions}",
+            "-e", f"CERNIS_STEALTH={'true' if cell.stealth else 'false'}",
             cell.service,
         ]
         rc = _run(cmd)

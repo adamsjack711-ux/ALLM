@@ -8,6 +8,6 @@ COPY benign_bots /app/benign_bots
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    ALLM_TARGET=http://capture:8080
+    CERNIS_TARGET=http://capture:8080
 
 CMD ["python3", "-m", "benign_bots.runner"]

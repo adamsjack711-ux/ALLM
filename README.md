@@ -1,13 +1,13 @@
 # — AI-Attack Detector
 
-ALLM is a tool that helps spot computer attacks run by an AI. It reads
+CERNIS is a tool that helps spot computer attacks run by an AI. It reads
 security logs and tries to tell when an AI agent — not a person — is doing
 the attack.
 
 ## What it does
 
-ALLM watches a stream of events from a computer system. Each event says
-what happened, what it touched, how deep it went, and when. ALLM reads
+CERNIS watches a stream of events from a computer system. Each event says
+what happened, what it touched, how deep it went, and when. CERNIS reads
 these events as they come in and answers two questions right away:
 
 1. **Is an AI agent behind this?** It gives a risk score for each short
@@ -22,7 +22,7 @@ common, trusted way to name attack moves.
 
 ## How it is built
 
-ALLM is a small set of Python programs:
+CERNIS is a small set of Python programs:
 
 - a simple baseline model
 - a model that reads events in order (a GRU)
@@ -41,11 +41,11 @@ neat order. They speed up as they go. And they touch many targets. Old
 tools miss this because each single action looks normal on its own. The
 give-away is the *pattern*: the order, the speed, and how wide it spreads.
 
-ALLM learns this pattern from the logs. Then it shows a security analyst
+CERNIS learns this pattern from the logs. Then it shows a security analyst
 what it found: which step, which events, and how sure it is. It also tries
 hard not to cry wolf.
 
-**What it does not do:** ALLM only *finds* attacks on systems we run. It
+**What it does not do:** CERNIS only *finds* attacks on systems we run. It
 does not stop an AI from making an attack in the first place. That is a
 different job and is not part of this project.
 

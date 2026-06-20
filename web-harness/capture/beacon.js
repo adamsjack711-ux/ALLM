@@ -1,4 +1,4 @@
-// allm-web-harness beacon (phase 1 stub)
+// cernis-web-harness beacon (phase 1 stub)
 // Confirms JS ran and posts a minimal readiness ping. Phase 3 extends this
 // with mouse/scroll/keypress cadence + honeypot dwell measurements.
 (function () {

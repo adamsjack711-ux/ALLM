@@ -1,6 +1,6 @@
 """Human-like simulator — slow cadence, mouse movement, no attack payloads.
 
-Sends the same `X-Allm-Source` mechanism as the bot, labeled `human_sim`.
+Sends the same `X-Cernis-Source` mechanism as the bot, labeled `human_sim`.
 Note (also called out in the README): this shares the Playwright /
 Chromium fingerprint with the bot, so the JS beacon discriminates on
 *cadence* (typing rhythm, mouse jitter, scroll, dwell) — not browser
@@ -23,7 +23,7 @@ from playwright.async_api import async_playwright  # noqa: E402
 
 LABEL = "human_sim"
 TARGET = get_target()
-SESSIONS = int(os.environ.get("ALLM_SESSIONS", "10"))
+SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "10"))
 DVWA_USER = os.environ.get("DVWA_USER", "admin")
 DVWA_PASS = os.environ.get("DVWA_PASS", "password")
 
@@ -90,7 +90,7 @@ async def browse(page) -> int:
 
 async def run_one(browser) -> int:
     ctx = await browser.new_context(
-        extra_http_headers={"X-Allm-Source": LABEL},
+        extra_http_headers={"X-Cernis-Source": LABEL},
         viewport={"width": 1280, "height": 800},
     )
     page = await ctx.new_page()

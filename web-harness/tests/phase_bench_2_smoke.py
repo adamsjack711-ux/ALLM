@@ -394,6 +394,104 @@ def _run_part_b() -> None:
     )
 
 
+# ── PART C: reference baselines wrapped to the contract ──────────────
+
+
+def _run_baseline(
+    baseline_name: str, *, td: pathlib.Path, sessions, splits_dir
+) -> dict:
+    from benchmark import evaluate as evalmod  # noqa: PLC0415
+    submission_dir = ROOT / "benchmark" / "baselines" / baseline_name
+    _assert(
+        (submission_dir / "submission.py").exists(),
+        f"[phase-bench-2] expected baseline at {submission_dir}",
+    )
+    out_dir = td / f"baseline_{baseline_name}"
+    return evalmod.run_eval(
+        submission_dir=submission_dir,
+        split="public_test",
+        splits_dir=splits_dir,
+        data_dir=td / "data",
+        seed=0,
+        fp_per_hour_budget=1.0,
+        out_dir=out_dir,
+        sessions=sessions,
+    )
+
+
+def _run_part_c() -> None:
+    from benchmark import build_splits as bsmod  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        splits_dir = td / "splits" / splitmod.SPLITS_VERSION
+        sessions = _synth_feature_sessions(seed=0)
+        metas = bsmod.sessions_to_meta(sessions)
+        split_set = splitmod.build_split_set(metas, seed=0)
+        splitmod.write_split_set(split_set, splits_dir)
+
+        # (C1) Non-training trivial baseline: ua_rule on public_test.
+        ua_results = _run_baseline(
+            "ua_rule", td=td, sessions=sessions, splits_dir=splits_dir,
+        )
+        for key in ("primary", "per_family", "agent_vs_benign_bot"):
+            _assert(
+                key in ua_results,
+                f"[phase-bench-2] ua_rule results missing {key!r}",
+            )
+        _assert(
+            0.0 <= ua_results["primary"]["pr_auc"] <= 1.0
+            or ua_results["primary"]["pr_auc"] != ua_results["primary"]["pr_auc"],
+            f"[phase-bench-2] ua_rule pr_auc out of [0,1]: "
+            f"{ua_results['primary']['pr_auc']}",
+        )
+
+        # (C2) Trainable baseline: aggregate_only (sklearn LR) end-to-end.
+        agg_results = _run_baseline(
+            "aggregate_only", td=td, sessions=sessions, splits_dir=splits_dir,
+        )
+        _assert(
+            "pr_auc" in agg_results["primary"],
+            "[phase-bench-2] aggregate_only primary missing pr_auc",
+        )
+        # aggregate_only should beat ua_rule on the synth data (the
+        # LR has direct access to the discriminative agg features).
+        # Skip the comparison if either is NaN.
+        pr_ua = ua_results["primary"]["pr_auc"]
+        pr_agg = agg_results["primary"]["pr_auc"]
+        if (
+            isinstance(pr_ua, (int, float)) and pr_ua == pr_ua
+            and isinstance(pr_agg, (int, float)) and pr_agg == pr_agg
+        ):
+            # Soft assertion: just require aggregate_only doesn't do
+            # *worse* than ua_rule. Hard inequality would be brittle on
+            # tiny synth data.
+            _assert(
+                pr_agg >= pr_ua - 0.05,
+                f"[phase-bench-2] aggregate_only PR-AUC ({pr_agg:.3f}) much "
+                f"worse than ua_rule ({pr_ua:.3f}) — sanity-check the wiring",
+            )
+
+        # (C3) Both baselines have all six reference baselines present
+        # in the on-disk layout (we don't run gru_only / hybrid in the
+        # smoke because PyTorch + tiny data is slow; their wiring
+        # mirrors aggregate_only).
+        for name in (
+            "ua_rule", "timing_threshold", "honeypot_only",
+            "aggregate_only", "gru_only", "hybrid",
+        ):
+            path = ROOT / "benchmark" / "baselines" / name / "submission.py"
+            _assert(
+                path.exists(),
+                f"[phase-bench-2] baseline {name} missing submission.py at {path}",
+            )
+
+    print(
+        "[phase-bench-2] PART C passed (baselines: ua_rule + aggregate_only "
+        "end-to-end + all six baseline submissions present)"
+    )
+
+
 # ── runner ───────────────────────────────────────────────────────────
 
 
@@ -401,7 +499,7 @@ def main() -> int:
     print("[phase-bench-2] running smoke (offline, no docker)…")
     _run_part_a()
     _run_part_b()
-    # PART C (baselines) lands in commit 3.
+    _run_part_c()
     print("[phase-bench-2] OK")
     return 0
 

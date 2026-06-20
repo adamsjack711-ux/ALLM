@@ -43,10 +43,13 @@ HP_FEATURE_NAMES = ("canary", "invisible_field", "admin_secrets", "robots_read")
 
 def sessions_to_public_features(sess_list) -> list[dict]:
     """Project a list of `features.Session` down to the public feature
-    schema. Truth fields (y, family, klass, stealth) are NOT included.
+    schema for EVAL (no labels).
 
-    Sequence features are returned as nested lists (JSON-serializable);
-    the submission can convert to a numpy array if it wants.
+    Used for the records passed to `submission.predict()`. Truth fields
+    (y, family, klass, stealth) are NOT included — the submission must
+    score blind. Sequence features are returned as nested lists
+    (JSON-serializable); the submission can convert to a numpy array
+    if it wants.
     """
     out: list[dict] = []
     for s in sess_list:
@@ -57,6 +60,32 @@ def sessions_to_public_features(sess_list) -> list[dict]:
             "seq": [[float(x) for x in row] for row in s.seq.tolist()],
             "hp": [float(x) for x in s.hp.tolist()],
         })
+    return out
+
+
+def sessions_to_train_features(sess_list) -> list[dict]:
+    """Public features + the supervised label `y` + family/klass for
+    stratification at TRAIN time only.
+
+    `submission.train(train, dev)` receives this shape. The labels here
+    are deliberate: any supervised model needs them. They are never
+    present in the `predict()` input.
+    """
+    out: list[dict] = []
+    for s in sess_list:
+        row = {
+            "session_id": s.session_id,
+            "target_app": s.target_app,
+            "agg": [float(x) for x in s.agg.tolist()],
+            "seq": [[float(x) for x in row] for row in s.seq.tolist()],
+            "hp": [float(x) for x in s.hp.tolist()],
+            # Labels — train-only:
+            "y": int(s.y),
+            "family": s.family,
+            "klass": s.klass,
+            "stealth": bool(s.stealth),
+        }
+        out.append(row)
     return out
 
 

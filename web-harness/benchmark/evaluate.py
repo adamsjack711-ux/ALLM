@@ -357,9 +357,12 @@ def run_eval(
     else:
         raise ValueError(f"unsupported split {split!r}")
 
-    # 3. Convert to public features + held-back truth (truth is local).
-    train_features = contractmod.sessions_to_public_features(train_sess)
-    dev_features = contractmod.sessions_to_public_features(dev_sess)
+    # 3. Train features include labels (y / family / klass / stealth)
+    #    so supervised baselines can fit. Eval features are public-only
+    #    so the submission has no way to peek at the answer at predict
+    #    time.
+    train_features = contractmod.sessions_to_train_features(train_sess)
+    dev_features = contractmod.sessions_to_train_features(dev_sess)
     eval_features = contractmod.sessions_to_public_features(eval_sess)
     truth = contractmod.sessions_to_truth(eval_sess)
     public_test_truth = contractmod.sessions_to_truth(public_test_sess)

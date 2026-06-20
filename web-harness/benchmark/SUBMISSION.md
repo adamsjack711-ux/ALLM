@@ -40,10 +40,25 @@ def train(train_features: list[dict], dev_features: list[dict]) -> None:
     Hold all state on a module-level variable or a class instance.
     The harness does not pickle / serialize anything between train
     and predict — they happen in the same process.
+
+    Training features carry labels (see "Train vs predict schemas"
+    below). Eval (predict) features do not.
     """
 ```
 
 If `train` is not defined, the harness skips straight to `predict`.
+
+### Train vs predict schemas
+
+Two distinct shapes, deliberately:
+
+- **`train()` / `dev_features`** include the supervised labels (`y`,
+  `family`, `klass`, `stealth`). Any supervised baseline needs them.
+- **`predict()` features** never include labels. The submission scores
+  blind.
+
+The harness builds both shapes from the same `data/` JSONL but never
+hands the eval input to a submission with the truth still attached.
 
 ## Public feature schema (v1)
 
@@ -57,8 +72,13 @@ Every feature dict has:
 | `seq` | list[list[float]] (T × 9) | per-request features in chronological order: `[delta_ms, status, is_post, path_bucket, req_bytes, resp_bytes, ua_bucket, header_count, header_hash]`. Variable T per session. |
 | `hp` | list[float] (len 4) | honeypot trip flags: `[canary, invisible_field, admin_secrets, robots_read]`. Each is 0.0 or 1.0. |
 
-Fields a submission does **not** see (held-back truth, used only for
-metrics): `y`, `family`, `klass`, `stealth`, `duration_s`, `src_label`.
+Fields **never** present in `predict()` features (held back so the
+submission can't peek): `y`, `family`, `klass`, `stealth`, `duration_s`,
+`src_label`.
+
+The train features (`train()` / `dev_features`) additionally include
+`y` + `family` + `klass` + `stealth` — supervised baselines need
+them to fit. `duration_s` and `src_label` are NEVER exposed.
 
 ## Submission output schema
 

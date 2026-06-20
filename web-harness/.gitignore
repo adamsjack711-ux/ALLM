@@ -1,0 +1,15 @@
+.env
+data/*
+!data/.gitkeep
+!data/reports
+data/reports/*
+!data/reports/.gitkeep
+data/models/
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+node_modules/
+
+.DS_Store

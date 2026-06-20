@@ -1,0 +1,16 @@
+FROM mcr.microsoft.com/playwright/python:v1.50.0-noble
+
+# Base image bundles browsers under /ms-playwright but does NOT pre-install
+# the Python `playwright` package — we add it here, pinned to the same
+# version as the bundled browsers.
+RUN pip install --no-cache-dir --break-system-packages playwright==1.50.0
+
+WORKDIR /app
+COPY shared /app/shared
+COPY playwright_bot/bot.py playwright_bot/payloads.txt /app/
+
+ENV PYTHONUNBUFFERED=1 \
+    ALLM_TARGET=http://capture:8080 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+CMD ["python3", "/app/bot.py"]

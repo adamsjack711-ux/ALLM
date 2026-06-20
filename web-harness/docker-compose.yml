@@ -1,0 +1,111 @@
+# allm-web-harness — phase 1
+# DVWA + MariaDB + capture proxy on a single bridge network.
+# Only the capture proxy publishes a host port, bound to 127.0.0.1.
+# Generators / detector / orchestrator land in later phases.
+
+services:
+  db:
+    image: mariadb:10.11
+    container_name: allm_db
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-dvwa_root}
+      MARIADB_DATABASE: ${DB_NAME:-dvwa}
+      MARIADB_USER: ${DB_USER:-dvwa}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-p@ssw0rd}
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${DB_ROOT_PASSWORD:-dvwa_root}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [allm_lab]
+    restart: unless-stopped
+
+  dvwa:
+    # ghcr.io/digininja/dvwa:latest — pin to a sha after first successful pull (see README).
+    image: ghcr.io/digininja/dvwa:latest
+    container_name: allm_dvwa
+    environment:
+      DB_SERVER: db
+      DB_DATABASE: ${DB_NAME:-dvwa}
+      DB_USERNAME: ${DB_USER:-dvwa}
+      DB_PASSWORD: ${DB_PASSWORD:-p@ssw0rd}
+      DEFAULT_SECURITY_LEVEL: ${DVWA_SECURITY_LEVEL:-low}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [allm_lab]
+    restart: unless-stopped
+
+  capture:
+    build: ./capture
+    container_name: allm_capture
+    environment:
+      UPSTREAM: http://dvwa:80
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    ports:
+      # 8090 is the human-capture port — host loopback only.
+      # 8080 is intentionally NOT published; reachable only on allm_lab.
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      - dvwa
+    networks: [allm_lab]
+    restart: unless-stopped
+
+  playwright_bot:
+    build:
+      context: ./generators
+      dockerfile: playwright_bot/Dockerfile
+    container_name: allm_playwright_bot
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_SESSIONS: ${ALLM_SESSIONS_BOT:-10}
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["generators"]
+
+  human_sim:
+    build:
+      context: ./generators
+      dockerfile: human_sim/Dockerfile
+    container_name: allm_human_sim
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_SESSIONS: ${ALLM_SESSIONS_HUMAN:-10}
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["generators"]
+
+  pentesterpro:
+    build:
+      context: ./generators
+      dockerfile: pentesterpro/Dockerfile
+    container_name: allm_pentesterpro
+    environment:
+      ALLM_TARGET: http://capture:8080
+      ALLM_SESSIONS: ${ALLM_SESSIONS_PPRO:-10}
+      DVWA_USER: ${DVWA_USER:-admin}
+      DVWA_PASS: ${DVWA_PASS:-password}
+    depends_on:
+      - capture
+    networks: [allm_lab]
+    profiles: ["generators"]
+
+  detector:
+    build: ./detector
+    container_name: allm_detector
+    volumes:
+      - ./data:/data
+    profiles: ["analysis"]
+
+networks:
+  allm_lab:
+    name: allm_lab
+    driver: bridge

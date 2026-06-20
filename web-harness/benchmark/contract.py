@@ -214,3 +214,46 @@ def read_jsonl(path: pathlib.Path) -> list[dict]:
             continue
         out.append(json.loads(line))
     return out
+
+
+def sessions_from_features_jsonl(
+    features_path: pathlib.Path, truth_path: pathlib.Path
+):
+    """Reconstruct `features.Session` objects from a public release's
+    features.jsonl + truth.jsonl pair.
+
+    Used when the eval harness runs against a packaged release rather
+    than a populated `data/` directory. The reconstruction is faithful
+    to every field downstream code touches; `ts_start` defaults to 0.0
+    because it isn't part of the public feature schema (the eval
+    doesn't need wall-clock ordering, only per-session features).
+    """
+    import numpy as np
+    from features import Session  # type: ignore
+
+    truth_by_sid = {r["session_id"]: r for r in read_jsonl(truth_path)}
+    out = []
+    for f in read_jsonl(features_path):
+        sid = f["session_id"]
+        t = truth_by_sid.get(sid)
+        if t is None:
+            continue
+        seq = (
+            np.array(f["seq"], dtype="float32")
+            if f["seq"] else np.zeros((1, 9), dtype="float32")
+        )
+        agg = np.array(f["agg"], dtype="float32")
+        hp = np.array(f["hp"], dtype="float32")
+        out.append(Session(
+            session_id=sid,
+            src_label=t.get("src_label") or t.get("family", ""),
+            seq=seq, agg=agg, hp=hp,
+            y=int(t["y"]),
+            duration_s=float(t["duration_s"]),
+            ts_start=0.0,
+            n_req=int(seq.shape[0]),
+            klass=t["klass"], family=t["family"],
+            target_app=t["target_app"],
+            stealth=bool(t["stealth"]),
+        ))
+    return out

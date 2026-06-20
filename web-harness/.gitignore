@@ -10,6 +10,11 @@ data/models/
 # same dirs ARE committed.
 benchmark/splits/*/private_*.json
 
+# phase-bench-3: release artifacts (built by `benchmark.release.build_release`)
+# live under dist/. Never committed — the public release ships via tar.gz
+# attached to a git tag instead.
+dist/
+
 __pycache__/
 *.pyc
 *.pyo

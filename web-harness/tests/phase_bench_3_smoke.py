@@ -30,11 +30,16 @@ from __future__ import annotations
 
 import json
 import pathlib
+import random
 import sys
+import tarfile
 import tempfile
+
+import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "detector"))
 
 from benchmark.release import scrub as scrubmod  # noqa: E402
 
@@ -190,13 +195,225 @@ def _run_part_a() -> None:
     )
 
 
+# ── PART B: build_release end-to-end ─────────────────────────────────
+
+
+def _synth_feature_sessions(seed: int = 0):
+    """Tiny synthetic session set (no human_real → no consent dependency
+    needed, keeps the build_release smoke focused on the packaging path)."""
+    from features import F_HP, F_REQ, F_SESS, Session  # type: ignore
+    rng = random.Random(seed)
+    nprng = np.random.default_rng(seed)
+    out: list[Session] = []
+    counter = 0
+    agent_families = ["playwright_bot", "selenium_bot", "sqlmap", "puppeteer_bot"]
+    stealth_capable = {"playwright_bot", "selenium_bot"}
+    for fam in agent_families:
+        for i in range(6):
+            stealth = i >= 3 and fam in stealth_capable
+            counter += 1
+            t = 8 + i
+            agg = nprng.normal(loc=2.0, scale=0.3, size=F_SESS).astype(np.float32)
+            seq = nprng.normal(loc=1.2, scale=0.4, size=(t, F_REQ)).astype(np.float32)
+            hp = np.zeros(F_HP, dtype=np.float32)
+            if rng.random() < 0.4:
+                hp[rng.randint(0, F_HP - 1)] = 1.0
+            out.append(Session(
+                session_id=f"{fam}-{i:02d}",
+                src_label=fam,
+                seq=seq, agg=agg, hp=hp,
+                y=1, duration_s=60.0 + i,
+                ts_start=1.0 * counter, n_req=t,
+                klass="agent", family=fam, target_app="dvwa",
+                stealth=stealth,
+            ))
+    for fam in ("googlebot", "uptime_monitor", "rss_reader"):
+        for i in range(6):
+            counter += 1
+            t = 5 + i
+            agg = nprng.normal(loc=0.0, scale=0.5, size=F_SESS).astype(np.float32)
+            seq = nprng.normal(loc=0.0, scale=0.6, size=(t, F_REQ)).astype(np.float32)
+            hp = np.zeros(F_HP, dtype=np.float32)
+            out.append(Session(
+                session_id=f"{fam}-{i:02d}",
+                src_label=fam,
+                seq=seq, agg=agg, hp=hp,
+                y=0, duration_s=120.0 + i,
+                ts_start=1.0 * counter, n_req=t,
+                klass="benign_bot", family=fam, target_app="dvwa",
+                stealth=False,
+            ))
+    for i in range(10):
+        counter += 1
+        t = 6 + i
+        agg = nprng.normal(loc=-1.0, scale=0.4, size=F_SESS).astype(np.float32)
+        seq = nprng.normal(loc=-0.5, scale=0.5, size=(t, F_REQ)).astype(np.float32)
+        hp = np.zeros(F_HP, dtype=np.float32)
+        out.append(Session(
+            session_id=f"human-sim-{i:02d}",
+            src_label="human_sim",
+            seq=seq, agg=agg, hp=hp,
+            y=0, duration_s=300.0 + i,
+            ts_start=1.0 * counter, n_req=t,
+            klass="human", family="human_sim", target_app="dvwa",
+            stealth=False,
+        ))
+    return out
+
+
+def _run_part_b() -> None:
+    from benchmark.release import build_release as brmod  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        data_dir = td / "data"
+        data_dir.mkdir()
+        # Empty sessions.jsonl + consent.jsonl so the consent filter
+        # sees zero human_real rows (synth doesn't include any).
+        (data_dir / "sessions.jsonl").write_text("")
+        (data_dir / "consent.jsonl").write_text("")
+        out_dir = td / "release" / "cernis-benchmark-v0.1-test"
+
+        sessions = _synth_feature_sessions(seed=0)
+        summary = brmod.build_release(
+            data_dir=data_dir,
+            out_dir=out_dir,
+            version="v0.1-test",
+            seed=0,
+            sessions=sessions,
+        )
+
+        # (B1) Release dir exists + has the expected top-level layout.
+        for relpath in (
+            "README.md", "TASK.md", "DATASHEET.md",
+            "LICENSE", "LICENSE-DATA",
+            "Makefile", "manifest.json",
+            "benchmark/contract.py", "benchmark/evaluate.py",
+            "benchmark/splits.py", "benchmark/SUBMISSION.md",
+            "splits/v1/MANIFEST.json",
+            "splits/v1/public_train.json",
+            "splits/v1/public_dev.json",
+            "splits/v1/public_test.json",
+            "data/features.jsonl", "data/truth.jsonl",
+            "data/excluded.json",
+        ):
+            _assert(
+                (out_dir / relpath).exists(),
+                f"[phase-bench-3] release missing expected file: {relpath}",
+            )
+
+        # (B2) NO private_*.json files anywhere in the release.
+        for path in out_dir.rglob("*"):
+            _assert(
+                "private_heldout" not in path.name,
+                f"[phase-bench-3] private split leaked into release: {path}",
+            )
+
+        # (B3) All six baselines shipped.
+        for name in (
+            "ua_rule", "timing_threshold", "honeypot_only",
+            "aggregate_only", "gru_only", "hybrid",
+        ):
+            sub = out_dir / "benchmark" / "baselines" / name / "submission.py"
+            _assert(
+                sub.exists(),
+                f"[phase-bench-3] release missing baseline {name}",
+            )
+
+        # (B4) Manifest checksums match the actual file contents.
+        manifest = json.loads((out_dir / "manifest.json").read_text())
+        # manifest.json itself is also tracked (added after-the-fact in
+        # build_release); the on-disk copy doesn't include its own
+        # checksum since it would change once written. Skip it.
+        for relpath, expected_sha in manifest["release_files"].items():
+            if relpath == "manifest.json":
+                continue
+            actual_sha = brmod._file_sha256(out_dir / relpath)
+            _assert(
+                actual_sha == expected_sha,
+                f"[phase-bench-3] manifest checksum mismatch for {relpath}: "
+                f"manifest={expected_sha[:12]}…  actual={actual_sha[:12]}…",
+            )
+
+        # (B5) Tar + sha256 exist and match.
+        tar_path = pathlib.Path(summary["tar"])
+        sha_path = tar_path.with_name(tar_path.name + ".sha256")
+        _assert(tar_path.exists(), f"[phase-bench-3] tar missing: {tar_path}")
+        _assert(sha_path.exists(), f"[phase-bench-3] tar sha256 missing: {sha_path}")
+        import hashlib
+        recomputed = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+        _assert(
+            recomputed == summary["tar_sha256"],
+            f"[phase-bench-3] tar sha256 doesn't match returned value",
+        )
+
+        # (B6) The tar has NO private_* inside it either.
+        with tarfile.open(tar_path, "r:gz") as t:
+            members = t.getnames()
+        for m in members:
+            _assert(
+                "private_heldout" not in m,
+                f"[phase-bench-3] tar contains private split: {m}",
+            )
+
+        # (B7) The released eval entry point — evaluate.py with
+        # --features-jsonl — runs the released ua_rule baseline against
+        # the released features and produces results.json with no
+        # `accuracy` substring.
+        sys.path.insert(0, str(out_dir))
+        from benchmark import evaluate as relevalmod  # type: ignore  # noqa: PLC0415
+        from benchmark import contract as relcontractmod  # type: ignore  # noqa: PLC0415
+        try:
+            sessions_from_release = relcontractmod.sessions_from_features_jsonl(
+                out_dir / "data" / "features.jsonl",
+                out_dir / "data" / "truth.jsonl",
+            )
+            _assert(
+                len(sessions_from_release) > 0,
+                "[phase-bench-3] could not reconstruct sessions from released JSONL",
+            )
+            eval_out = td / "release_eval"
+            relevalmod.run_eval(
+                submission_dir=out_dir / "benchmark" / "baselines" / "ua_rule",
+                split="public_test",
+                splits_dir=out_dir / "splits" / "v1",
+                data_dir=data_dir,  # unused — sessions injected
+                seed=0,
+                fp_per_hour_budget=1.0,
+                out_dir=eval_out,
+                sessions=sessions_from_release,
+            )
+            results_text = (eval_out / "results.json").read_text().lower()
+            _assert(
+                "accuracy" not in results_text,
+                "[phase-bench-3] released eval produced forbidden 'accuracy' substring",
+            )
+            # Also verify the report.txt rendered.
+            _assert(
+                (eval_out / "report.txt").exists(),
+                "[phase-bench-3] released eval did not write report.txt",
+            )
+        finally:
+            try:
+                sys.path.remove(str(out_dir))
+            except ValueError:
+                pass
+
+    print(
+        "[phase-bench-3] PART B passed "
+        "(release built + scrubbed + no private split + manifest sha matches + "
+        "released eval reproduces)"
+    )
+
+
 # ── runner ───────────────────────────────────────────────────────────
 
 
 def main() -> int:
     print("[phase-bench-3] running smoke (offline, no docker)…")
     _run_part_a()
-    # PARTS B + C land in commits 2 + 3.
+    _run_part_b()
+    # PART C lands in commit 3.
     print("[phase-bench-3] OK")
     return 0
 

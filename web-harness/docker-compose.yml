@@ -601,6 +601,34 @@ services:
     profiles: ["crapi"]
     restart: unless-stopped
 
+  # ── phase-bench-1: real autonomous LLM browser agent ────────────────
+  # The ONLY lab component that talks to a cloud API. Gated behind its
+  # own `real-agent` profile so it does not start under the default
+  # `docker compose up`. Bring up with:
+  #     docker compose --profile real-agent up --build real_agent
+  # API key comes from .env (gitignored). The bot enforces
+  # CERNIS_TARGET against target_guard's allow-list before any LLM
+  # call, so an injected prompt can't reach off-lab targets.
+
+  real_agent:
+    build:
+      context: ./generators
+      dockerfile: real_agent/Dockerfile
+    container_name: cernis_real_agent
+    env_file:
+      - .env
+    environment:
+      CERNIS_TARGET: ${REAL_AGENT_TARGET:-http://capture:8080}
+      CERNIS_TARGET_APP: ${REAL_AGENT_TARGET_APP:-dvwa}
+      CERNIS_SESSIONS: ${CERNIS_SESSIONS_REAL_AGENT:-1}
+      CERNIS_AGENT_BACKEND: ${CERNIS_AGENT_BACKEND:-openai}
+      CERNIS_AGENT_MODEL: ${CERNIS_AGENT_MODEL:-gpt-4o-mini}
+      CERNIS_STEALTH: "false"
+    depends_on:
+      - capture
+    networks: [cernis_lab]
+    profiles: ["real-agent"]
+
 networks:
   cernis_lab:
     name: cernis_lab

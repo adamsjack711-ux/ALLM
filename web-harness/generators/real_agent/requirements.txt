@@ -1,0 +1,8 @@
+# phase-bench-1 (PART B) — pinned to a known-working stack so a
+# browser-use API shift doesn't silently break captures. Bump
+# deliberately; bump alone won't change the captured dataset shape
+# (everything we care about is in the X-Cernis-* headers + manifest).
+browser-use==0.1.40
+langchain-openai==0.2.14
+langchain-anthropic==0.3.3
+httpx==0.27.2

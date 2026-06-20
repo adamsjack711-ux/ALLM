@@ -30,6 +30,7 @@ pointed at DVWA at security levels low → high.
 | 11 | Scanner family (nikto / ffuf / raw_httpx / scrapy) + proxy session-schema cache | ✅ |
 | 12 | crAPI as fourth target (OWASP API security demo, 7 backing services) | ✅ |
 | 13 | Production access-log shipper (`ingest/`) — passive nginx/Apache log → requests.jsonl | ✅ |
+| bench-1 | Consent-gated `human_real` capture + one real LLM browser agent (`real_agent`) | ✅ |
 
 ## Hard constraints (enforced in code, not docs)
 
@@ -901,6 +902,121 @@ all sessions `y=0`.
   access.log.1.gz | …` in front for backfill from rotations.
 - Producing training data. Production traffic is unlabeled; the
   shipper is for inference inputs, not training inputs.
+
+## phase-bench-1 — consent-gated human capture + one real LLM agent
+
+The detector has historically trained on **simulated** humans (`human_sim`)
+and bot-flavored attackers. phase-bench-1 closes the gap with two new
+labeled channels — one human, one agent — both flowing through the
+existing capture proxy with the same labels and provenance shape.
+
+### A. Real-human capture (`human_real`)
+
+The `:8090` capture listener used to record any request that hit it.
+It now runs a `consent_gate_middleware` in front of the existing
+session/logging middleware:
+
+- `GET  /__consent` — serves `capture/consent.html`. The page states
+  exactly what is and isn't collected, names the purpose (a public
+  detection benchmark), and requires an explicit opt-in click.
+- `POST /__consent/accept` — mints a `consent_id` and a `cernis_sid`,
+  writes one row each to `data/consent.jsonl` and `data/sessions.jsonl`
+  (with `class=human / family=human_real` and `extra.consent_id` linking
+  back to the consent row), sets both as `HttpOnly` `SameSite=Lax`
+  cookies, then 302 to the DVWA root.
+- Every other path returns **403** with a link to `/__consent` until
+  the consent cookie is present.
+
+Rows captured on the human channel are anonymized at write time by
+`capture/redaction.py`:
+
+- `src_ip` → `None` (raw IP never persists)
+- `ua`     → coarse browser-family + device-type bucket
+              (`chrome-desktop` / `firefox-mobile` / …) — the raw UA
+              is derived once at consent time and immediately discarded.
+
+Bodies were already not logged; auth/cookie headers were already
+written as booleans only. Other channels are unchanged — they only
+carry container-internal generator traffic.
+
+**Capture a real session:**
+
+```sh
+docker compose up -d --build      # bring up DVWA + capture
+open http://127.0.0.1:8090/__consent   # read terms, click "I agree"
+# log in to DVWA with admin / password, browse a few pages, close tab
+```
+
+### B. One real autonomous LLM browser agent (`real_agent`)
+
+A single generator backed by [browser-use](https://github.com/browser-use/browser-use)
++ OpenAI / Anthropic. Runs Playwright internally; sends the X-Cernis-*
+label headers via the BrowserContext so the proxy persists
+`class=agent / family=llm_browser_agent` per row. The bot calls
+`target_guard.get_target()` *before* importing the LLM client — an
+injected or jailbroken prompt cannot steer the browser off the
+allow-list because the validation happens before a single LLM token
+is requested.
+
+This is the **only** lab component that talks to a cloud API. It's
+gated under its own compose profile so it does not auto-start:
+
+```sh
+# 1. Put your key in .env (gitignored).
+cp .env.example .env
+$EDITOR .env     # uncomment OPENAI_API_KEY=... (or ANTHROPIC_API_KEY)
+
+# 2. Bring up just the real agent against the already-running capture.
+docker compose --profile real-agent up --build real_agent
+```
+
+Required env vars (in `.env`):
+
+| var | default | notes |
+|---|---|---|
+| `OPENAI_API_KEY` | — | required if `CERNIS_AGENT_BACKEND=openai` (default) |
+| `ANTHROPIC_API_KEY` | — | required if `CERNIS_AGENT_BACKEND=anthropic` |
+| `CERNIS_AGENT_BACKEND` | `openai` | `openai` \| `anthropic` |
+| `CERNIS_AGENT_MODEL` | `gpt-4o-mini` | backend-specific default |
+| `CERNIS_AGENT_TASK` | log in + visit two pages | free-text prompt |
+| `CERNIS_SESSIONS_REAL_AGENT` | `1` | how many sessions to run |
+
+The bot never prints, logs, or persists the API key. The smoke test
+asserts that no `sk-*` / `sk-ant-*` substring (and no live value of
+the env-vars at test time) appears anywhere in the worktree or
+`data/`.
+
+### Sanity printout (no detector)
+
+```sh
+python3 scripts/phase_bench_1_summary.py
+```
+
+Per-(class, family) session counts plus a crude eyeball comparison
+(median `delta_ms`, beacon presence ratio) so you can confirm human
+and agent rows look different before pointing any model at the data.
+
+### Smoke
+
+```sh
+python3 tests/phase_bench_1_smoke.py   # offline, <5s, no docker, no API call
+```
+
+Asserts: unconsented `:8090` captures are blocked; consent flow mints
+both cookies and writes both rows; consented human rows have
+`src_ip=None` + bucketed `ua` + no leaked auth value;
+`real_agent/bot.py` refuses to start when `CERNIS_TARGET` is
+off-allow-list (covers prompt-injection / misconfig); both
+`class=human` and `class=agent` reach `sessions.jsonl` with
+provenance; no API-key substring is committed or written to `data/`.
+
+### Out of scope for phase-bench-1 (later phases)
+
+- Leaderboard or paper writeup.
+- Detector training / eval against this new data.
+- Stealth variant of `real_agent`.
+- Multi-target `real_agent` (DVWA only for now).
+- Multiple LLM backends running in parallel (one at a time).
 
 ## Out of scope
 

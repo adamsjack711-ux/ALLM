@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cernis benchmark — consent</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 640px; margin: 4em auto; padding: 0 1em; line-height: 1.5;
+         color: #222; }
+  h1 { font-size: 1.4em; }
+  ul { padding-left: 1.2em; }
+  .meta { font-size: 0.85em; color: #666; margin-top: 2em; }
+  form { margin-top: 1.5em; }
+  button { font-size: 1em; padding: 0.6em 1.2em; cursor: pointer; }
+  .creds { background: #f4f4f4; padding: 0.6em 1em; border-left: 3px solid #888;
+           font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<h1>Cernis benchmark — consent</h1>
+
+<p>This browser session will be recorded to build a <strong>public dataset for
+detecting AI-driven web agents</strong>. Recording is anonymous and your
+participation is voluntary.</p>
+
+<h2>What is collected</h2>
+<ul>
+  <li>Behavioural / timing features per HTTP request (which page, status code,
+      bytes, how long since the previous click, request rate).</li>
+  <li>Page-level beacons sent by the test app (mouse movement, scroll, time to
+      first interaction). Used to tell humans apart from automated agents.</li>
+  <li>A coarse browser bucket (e.g. <code>chrome-desktop</code>) — derived once
+      from your User-Agent and immediately discarded.</li>
+</ul>
+
+<h2>What is NOT collected</h2>
+<ul>
+  <li>Your IP address.</li>
+  <li>Your raw User-Agent string.</li>
+  <li>Request bodies (anything you type into a form).</li>
+  <li>Cookies, authorization headers, or any credentials.</li>
+  <li>Any identifying information whatsoever.</li>
+</ul>
+
+<h2>Purpose</h2>
+<p>The recorded sessions become part of a benchmark used to train and evaluate
+detectors for autonomous LLM-driven browser agents. The benchmark may be
+released publicly.</p>
+
+<h2>How to use the test app after you accept</h2>
+<p>You'll be redirected to <strong>DVWA</strong> (a deliberately-vulnerable
+test web app). It will ask you to log in. Use these credentials:</p>
+<p class="creds">username: <strong>admin</strong> &nbsp;&nbsp; password: <strong>password</strong></p>
+<p>Then browse a few pages naturally — there's nothing specific you have to do.
+When you're finished, just close the tab.</p>
+
+<form method="POST" action="/__consent/accept">
+  <button type="submit">I agree — start the session</button>
+</form>
+
+<p class="meta">Consent text version: <strong>v1</strong> · Lab is loopback-only
+(<code>127.0.0.1:8090</code>) · No data leaves this machine.</p>
+</body>
+</html>

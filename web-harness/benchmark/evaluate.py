@@ -36,6 +36,7 @@ import json
 import pathlib
 import random
 import sys
+import time
 from typing import Optional
 
 import numpy as np
@@ -48,6 +49,7 @@ from features import build_sessions  # type: ignore  # noqa: E402
 
 from benchmark import contract as contractmod  # noqa: E402
 from benchmark import splits as splitmod  # noqa: E402
+from benchmark import runner_container as runnermod  # noqa: E402
 
 # Paths the eval harness is allowed to open under each SPLIT name.
 # public_train.json + public_dev.json are always readable (the
@@ -237,13 +239,17 @@ def _session_hours(truth: dict[str, dict]) -> float:
 # ── eval main flow ───────────────────────────────────────────────────
 
 
-def _run_submission(
+def _run_submission_python(
     submission_dir: pathlib.Path,
     train_features: list[dict],
     dev_features: list[dict],
     eval_features: list[dict],
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
+    """Python-entrypoint flavor: import submission as a module, call
+    train()/predict() in-process. Returns (rows, resource_dict).
+    """
     mod = contractmod.load_submission_module(submission_dir)
+    t0 = time.monotonic()
     if hasattr(mod, "train"):
         mod.train(train_features, dev_features)
     if not hasattr(mod, "predict"):
@@ -251,11 +257,46 @@ def _run_submission(
             f"submission {submission_dir} missing predict(features) function"
         )
     rows = mod.predict(eval_features)
+    wall = time.monotonic() - t0
     if not isinstance(rows, list):
         raise RuntimeError(
             f"submission.predict() returned {type(rows).__name__}, expected list"
         )
-    return rows
+    return rows, {
+        "wall_time_s": wall,
+        "peak_mem_mb": None,
+        "exit_status": 0,
+    }
+
+
+def _run_submission_container(
+    image: str,
+    train_features: list[dict],
+    dev_features: list[dict],
+    eval_features: list[dict],
+    *,
+    memory: str = "4g",
+    cpus: str = "2",
+    timeout_s: float = 600.0,
+) -> tuple[list[dict], dict]:
+    """Container flavor: run the submission image with --network none.
+    Returns (rows, resource_dict). Raises if docker is unreachable.
+    """
+    result = runnermod.run_container(
+        image, eval_features,
+        train_features=train_features, dev_features=dev_features,
+        memory=memory, cpus=cpus, timeout_s=timeout_s,
+    )
+    if result.exit_status != 0:
+        raise RuntimeError(
+            f"container submission exited with status {result.exit_status} "
+            f"after {result.wall_time_s:.2f}s; no scores produced"
+        )
+    return result.rows, {
+        "wall_time_s": result.wall_time_s,
+        "peak_mem_mb": result.peak_mem_mb,
+        "exit_status": result.exit_status,
+    }
 
 
 def _results_to_report(results: dict) -> str:
@@ -269,6 +310,19 @@ def _results_to_report(results: dict) -> str:
     lines.append(f"  n_sessions        {results['n_sessions']}")
     lines.append(f"  session_hours     {results['session_hours']:.3f}")
     lines.append(f"  fp_per_hour_budget {results['fp_per_hour_budget']:.3f}")
+    lines.append(f"  runner            {results.get('runner', 'python')}")
+    if results.get("container_image"):
+        lines.append(f"  container_image   {results['container_image']}")
+    res = results.get("resource") or {}
+    wall = res.get("wall_time_s")
+    mem = res.get("peak_mem_mb")
+    exitc = res.get("exit_status")
+    if wall is not None:
+        lines.append(f"  wall_time_s       {wall:.2f}")
+    if mem is not None:
+        lines.append(f"  peak_mem_mb       {mem:.1f}")
+    if exitc is not None:
+        lines.append(f"  exit_status       {exitc}")
     lines.append("")
     p = results.get("primary", {})
     lines.append("PRIMARY")
@@ -317,6 +371,10 @@ def run_eval(
     fp_per_hour_budget: float,
     out_dir: pathlib.Path,
     sessions: Optional[list] = None,
+    container_image: Optional[str] = None,
+    container_memory: str = "4g",
+    container_cpus: str = "2",
+    container_timeout_s: float = 600.0,
 ) -> dict:
     """Run the full eval pipeline; return the results dict and write
     results.json + report.txt to `out_dir`.
@@ -367,10 +425,21 @@ def run_eval(
     truth = contractmod.sessions_to_truth(eval_sess)
     public_test_truth = contractmod.sessions_to_truth(public_test_sess)
 
-    # 4. Run submission.
-    raw_rows = _run_submission(
-        submission_dir, train_features, dev_features, eval_features,
-    )
+    # 4. Run submission. The Python flavor imports submission.py in-process;
+    #    the container flavor docker-runs a pre-built image with --network
+    #    none. Both produce list[dict] rows + a resource accounting block.
+    if container_image is not None:
+        raw_rows, resource = _run_submission_container(
+            container_image, train_features, dev_features, eval_features,
+            memory=container_memory, cpus=container_cpus,
+            timeout_s=container_timeout_s,
+        )
+        runner_kind = "container"
+    else:
+        raw_rows, resource = _run_submission_python(
+            submission_dir, train_features, dev_features, eval_features,
+        )
+        runner_kind = "python"
     errors = contractmod.validate_submission_output(
         raw_rows, {f["session_id"] for f in eval_features},
     )
@@ -473,6 +542,9 @@ def run_eval(
         "agent_vs_benign_bot": _agent_vs_benign_bot(
             truth, scores_by_sid, threshold,
         ),
+        "runner": runner_kind,
+        "resource": resource,
+        "container_image": container_image,
         "built_at": dt.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -488,9 +560,14 @@ def run_eval(
             "report.txt contains forbidden 'accuracy' substring"
         )
 
-    # `built_at` is wall-clock — strip from the file so two same-seed
-    # runs produce byte-identical results.json (reproducibility gate).
-    results_for_disk = {k: v for k, v in results.items() if k != "built_at"}
+    # `built_at` is wall-clock; `resource` carries wall-time + peak
+    # memory; `container_image` is per-run config. All three are
+    # stripped from the on-disk results.json so two same-seed runs
+    # produce byte-identical files (reproducibility gate). The
+    # leaderboard captures the resource info — that JSONL is not
+    # reproducible by design.
+    _non_repro = ("built_at", "resource", "container_image")
+    results_for_disk = {k: v for k, v in results.items() if k not in _non_repro}
     (out_dir / "results.json").write_text(
         json.dumps(results_for_disk, indent=2, sort_keys=True)
     )
@@ -519,6 +596,26 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fp-per-hour-budget", type=float, default=1.0)
     ap.add_argument("--out", type=pathlib.Path, default=None)
+    ap.add_argument(
+        "--container-image", default=None,
+        help="Run the submission inside this docker image with "
+             "--network none, instead of importing submission.py "
+             "in-process. The --submission directory is still required "
+             "(used as the leaderboard identity hash); the image is "
+             "what actually runs.",
+    )
+    ap.add_argument("--container-memory", default="4g",
+                    help="docker --memory cap for the container runner (default 4g)")
+    ap.add_argument("--container-cpus", default="2",
+                    help="docker --cpus cap for the container runner (default 2)")
+    ap.add_argument("--container-timeout-s", type=float, default=600.0,
+                    help="kill the container after this many seconds (default 600)")
+    ap.add_argument(
+        "--leaderboard", type=pathlib.Path, default=None,
+        help="Append the results to this leaderboard.jsonl (append-only). "
+             "Use `python -m benchmark.leaderboard` to regenerate the "
+             "markdown rollup.",
+    )
     args = ap.parse_args()
 
     out_dir = args.out or (
@@ -547,9 +644,27 @@ def main() -> int:
         fp_per_hour_budget=args.fp_per_hour_budget,
         out_dir=out_dir,
         sessions=sessions,
+        container_image=args.container_image,
+        container_memory=args.container_memory,
+        container_cpus=args.container_cpus,
+        container_timeout_s=args.container_timeout_s,
     )
     print((out_dir / "report.txt").read_text(), end="")
     print(f"[evaluate] wrote {out_dir / 'results.json'}")
+
+    if args.leaderboard is not None:
+        from benchmark import leaderboard as lbmod
+        entry = lbmod.append_entry(
+            args.leaderboard,
+            submission_dir=args.submission,
+            results=results,
+            resource=results.get("resource", {}),
+            runner=results.get("runner", "python"),
+        )
+        print(
+            f"[evaluate] appended leaderboard entry "
+            f"({entry.submission_hash[:14]}…) → {args.leaderboard}"
+        )
     return 0
 
 

@@ -138,6 +138,154 @@ _DEFAULT_BENIGN = [
 ]
 
 
+# ----------------------------------------------------------------------
+# Phase 14: LLM-agent cell matrix
+# ----------------------------------------------------------------------
+#
+# Real-LLM cells are deliberately segregated from the deterministic
+# scanner / browser-bot families above. The deterministic families run
+# under the default `docker compose --profile generators up`; the LLM
+# matrix only runs when `--include-llm` is explicitly passed AND the
+# operator has set OPENAI_API_KEY / ANTHROPIC_API_KEY. The framework
+# always supports `--llm-dry-run` for enumeration-without-API-spend.
+
+_DEFAULT_LLM_BACKENDS = ("openai", "anthropic")
+_DEFAULT_LLM_MODELS = {
+    "openai": ("gpt-4o-mini",),
+    "anthropic": ("claude-haiku-4-5",),
+}
+
+# Browser-driven LLM cells against HTML targets present in `_TARGETS`.
+# VAmPI is JSON-only — excluded because a browser-use agent there adds
+# no detection signal beyond what sqlmap / raw_httpx already produce.
+# WebGoat isn't in `_TARGETS` either (it was scoped in phase 7 prose
+# but never landed as a sweep target). Both are phase-14 follow-up
+# items: an HTTP-only LLM client for VAmPI + adding WebGoat to the
+# target registry.
+_LLM_TARGETS = ("dvwa", "juice_shop", "crapi")
+
+
+@dataclasses.dataclass(frozen=True)
+class LlmSweepCell:
+    target_app: str
+    target_url: str
+    backend: str
+    model: str
+    stealth: bool
+    sessions: int
+
+    def family(self) -> str:
+        """Mirror the family naming convention from
+        generators/real_agent/bot.py::_family_name so the sweep can
+        report on what the capture proxy will see."""
+        import re as _re
+        slug = lambda s: _re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+        return f"llm_{slug(self.backend)}_{slug(self.model)}"
+
+    def to_cellsfile_entry(self) -> dict:
+        """Shape the bot's `_build_cells_from_file` expects."""
+        return {
+            "target_url": self.target_url,
+            "target_app": self.target_app,
+            "backend": self.backend,
+            "model": self.model,
+            "stealth": self.stealth,
+            "sessions": self.sessions,
+        }
+
+
+def default_llm_config(
+    *,
+    backends: Iterable[str] = _DEFAULT_LLM_BACKENDS,
+    models: dict[str, Iterable[str]] | None = None,
+    target_apps: Iterable[str] = _LLM_TARGETS,
+    stealth_axes: tuple[bool, ...] = (False, True),
+    sessions_per_cell: int = 2,
+) -> list[LlmSweepCell]:
+    """Build the LLM-agent cell matrix. Default: 4 targets × 2 backends
+    × 1 model each × 2 stealth = 16 cells. Caller can override any
+    axis; passing `models={"openai": ("gpt-4o-mini", "gpt-4-turbo")}`
+    multiplies the matrix per backend."""
+    models = dict(models or _DEFAULT_LLM_MODELS)
+    cells: list[LlmSweepCell] = []
+    for target_app in target_apps:
+        if target_app not in _TARGETS:
+            raise ValueError(
+                f"unknown target_app {target_app!r}; expected one of "
+                f"{sorted(_TARGETS)}"
+            )
+        url = _TARGETS[target_app]["url"]
+        for backend in backends:
+            for model in models.get(backend, ()):
+                for stealth in stealth_axes:
+                    cells.append(LlmSweepCell(
+                        target_app=target_app, target_url=url,
+                        backend=backend, model=model,
+                        stealth=stealth, sessions=sessions_per_cell,
+                    ))
+    return cells
+
+
+def write_llm_cells_file(
+    cells: Iterable[LlmSweepCell], path: pathlib.Path,
+) -> None:
+    """Emit the JSON shape that `real_agent/bot.py` consumes via
+    CERNIS_AGENT_CELLS_FILE. The bot will validate each entry through
+    target_guard at startup."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {"cells": [c.to_cellsfile_entry() for c in cells]},
+        indent=2,
+    ))
+
+
+def execute_llm_sweep(
+    cells: list[LlmSweepCell],
+    *,
+    dry_run: bool = False,
+    cells_file: pathlib.Path | None = None,
+) -> dict:
+    """Run the LLM matrix as a SINGLE `real_agent` invocation that
+    reads CERNIS_AGENT_CELLS_FILE. Returns a summary dict.
+
+    `dry_run=True` sets CERNIS_AGENT_DRY_RUN=1 inside the container,
+    so target_guard validation still happens but no LLM is called.
+    Use this to verify the cell-file is well-formed against the
+    bundled targets before spending API budget.
+
+    `cells_file` defaults to `data/llm_cells.json` so the artifact is
+    inspectable post-run.
+    """
+    cells_file = cells_file or (DATA / "llm_cells.json")
+    write_llm_cells_file(cells, cells_file)
+    env_flags = [
+        "-e", f"CERNIS_AGENT_CELLS_FILE=/data/{cells_file.name}",
+        # NB: CERNIS_TARGET is unused in matrix mode, but target_guard
+        # still calls get_target() in single-cell mode — set it to one
+        # of the allow-listed URLs so a future code path that falls
+        # back to single-cell doesn't crash.
+        "-e", f"CERNIS_TARGET={cells[0].target_url}" if cells else "",
+    ]
+    if dry_run:
+        env_flags.extend(["-e", "CERNIS_AGENT_DRY_RUN=1"])
+    cmd = [
+        "docker", "compose", "--profile", "real-agent",
+        "run", "--rm",
+        *[f for f in env_flags if f],
+        "-v", f"{cells_file.parent.absolute()}:/data:ro",
+        "real_agent",
+    ]
+    t0 = time.time()
+    rc = _run(cmd)
+    return {
+        "n_cells": len(cells),
+        "cells_file": str(cells_file),
+        "dry_run": dry_run,
+        "rc": rc,
+        "elapsed_s": round(time.time() - t0, 1),
+    }
+
+
 def default_config(
     sessions_per_cell: int = 2,
     benign_sessions: int = 3,
@@ -358,6 +506,25 @@ def main(argv: list[str] | None = None) -> int:
                          "an aborted sweep.")
     ap.add_argument("--out", type=pathlib.Path, default=None,
                     help="path for sweep_<ts>.json; default data/reports/sweep_<ts>.json")
+    # phase 14: real-LLM cells (opt-in, off by default to avoid surprise API spend)
+    ap.add_argument("--include-llm", action="store_true",
+                    help="Append the LLM-agent matrix (4 targets × N backends × "
+                         "M models × 2 stealth) to the sweep. OFF by default — "
+                         "real-LLM cells cost API budget.")
+    ap.add_argument("--llm-backends", default=",".join(_DEFAULT_LLM_BACKENDS),
+                    help="comma-separated backends for the LLM matrix "
+                         "(default openai,anthropic)")
+    ap.add_argument("--llm-models", default="",
+                    help="comma-separated backend:model overrides, e.g. "
+                         "openai:gpt-4o-mini,anthropic:claude-haiku-4-5. "
+                         "Empty → built-in defaults per backend.")
+    ap.add_argument("--llm-sessions", type=int, default=2,
+                    help="sessions per LLM cell (default 2)")
+    ap.add_argument("--llm-dry-run", action="store_true",
+                    help="enumerate the LLM matrix and run the real_agent "
+                         "container with CERNIS_AGENT_DRY_RUN=1 (target_guard "
+                         "validation only; zero API calls). Useful before "
+                         "paying budget.")
     args = ap.parse_args(argv)
 
     sec_levels = tuple(s.strip() for s in args.security_levels.split(",") if s.strip())
@@ -369,16 +536,57 @@ def main(argv: list[str] | None = None) -> int:
     plan = build_sweep_plan(config)
     print(f"[sweep] config: {json.dumps(config.to_summary(), indent=2)}")
 
+    # phase 14: LLM matrix enumeration (build always; execute only if asked)
+    llm_cells: list[LlmSweepCell] = []
+    llm_run: dict | None = None
+    if args.include_llm or args.llm_dry_run:
+        backends = tuple(b.strip() for b in args.llm_backends.split(",") if b.strip())
+        models_override: dict[str, list[str]] = {b: [] for b in backends}
+        for token in (args.llm_models or "").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" not in token:
+                raise SystemExit(
+                    f"[sweep] --llm-models entry {token!r} must be backend:model"
+                )
+            b, m = token.split(":", 1)
+            b = b.strip()
+            models_override.setdefault(b, []).append(m.strip())
+        for b in backends:
+            if not models_override.get(b):
+                models_override[b] = list(_DEFAULT_LLM_MODELS.get(b, ()))
+        llm_cells = default_llm_config(
+            backends=backends, models=models_override,
+            sessions_per_cell=args.llm_sessions,
+        )
+        print(f"[sweep] LLM matrix: {len(llm_cells)} cells "
+              f"(backends={list(backends)}, dry_run={args.llm_dry_run})")
+
     cell_results: list[dict] = []
     if not args.skip_docker:
         start_benign(config)
         cell_results = execute_sweep(plan)
+        if llm_cells:
+            llm_run = execute_llm_sweep(llm_cells, dry_run=args.llm_dry_run)
 
     report = build_sweep_report(
         DATA, plan, fp_per_hour_budget=args.fp_budget,
     )
     report["config"] = config.to_summary()
     report["cell_run_results"] = cell_results
+    if llm_cells:
+        report["llm_matrix"] = {
+            "n_cells": len(llm_cells),
+            "axes": {
+                "target_app": sorted({c.target_app for c in llm_cells}),
+                "backend": sorted({c.backend for c in llm_cells}),
+                "model": sorted({c.model for c in llm_cells}),
+                "stealth": sorted({c.stealth for c in llm_cells}),
+            },
+            "families_planned": sorted({c.family() for c in llm_cells}),
+            "run": llm_run,
+        }
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = args.out or (REPORTS / f"sweep_{ts}.json")

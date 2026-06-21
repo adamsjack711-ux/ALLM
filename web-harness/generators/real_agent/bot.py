@@ -1,98 +1,334 @@
-"""Real autonomous LLM-driven browser agent (phase-bench-1, PART B).
+"""Real autonomous LLM-driven browser agent (phase-bench-1 PART B, expanded
+to a matrix-driven cell runner in phase 14).
 
 This is the ONE generator in the lab that talks to a cloud LLM. It runs
-`browser-use` (Playwright-driven LLM agent) against the bundled DVWA via
-the capture proxy. Everything else in the lab is deterministic and
-offline; this generator is gated behind its own compose profile
+`browser-use` (Playwright-driven LLM agent) against the bundled targets via
+the per-target capture proxy. Everything else in the lab is deterministic
+and offline; this generator is gated behind its own compose profile
 (`profiles: ["real-agent"]`) so it does not start under the default
 `docker compose up`.
 
+Two execution modes:
+
+  - **single-cell** (phase-bench-1, the default) — the original behavior.
+    CERNIS_TARGET + CERNIS_TARGET_APP + CERNIS_AGENT_BACKEND +
+    CERNIS_AGENT_MODEL pick one cell; CERNIS_SESSIONS sets the repeat
+    count.
+
+  - **matrix** (phase 14) — `CERNIS_AGENT_CELLS_FILE=/path/to/cells.json`
+    drives a matrix of (target_app, backend, model, stealth) cells in a
+    single container run. Each cell is validated against `target_guard`
+    independently. Format:
+
+        {
+          "cells": [
+            {"target_url": "http://capture:8080",
+             "target_app": "dvwa",
+             "backend": "openai",
+             "model": "gpt-4o-mini",
+             "stealth": false,
+             "sessions": 2,
+             "task": "Open {target}. Log in admin/password ..."}
+          ]
+        }
+
+    `task` is optional; if omitted, the built-in per-target default in
+    `_DEFAULT_TASKS` is used (with `{target}` substituted).
+
 Guarantees, enforced in this file:
 
-1. target_guard.get_target() runs *before* any browser-use / LLM import.
-   If CERNIS_TARGET points anywhere other than the allow-list, the
-   process exits non-zero before a single LLM token is requested.
+  1. `target_guard.assert_loopback_target(...)` runs *before* any
+     browser-use / LLM import, **per cell**. If any cell's URL points
+     anywhere other than the allow-list, the process exits non-zero
+     before a single LLM token is requested for any cell.
 
-2. The API key is read from the environment (OPENAI_API_KEY or
-   ANTHROPIC_API_KEY). It is never printed, never logged, never written
-   to any file. The startup banner names only the backend + model.
+  2. The API key is read from the environment (OPENAI_API_KEY or
+     ANTHROPIC_API_KEY). It is never printed, never logged, never
+     written to any file. The startup banner names only the backend +
+     model.
 
-3. Every browser request carries the X-Cernis-* label headers via the
-   Playwright BrowserContext, so the capture proxy persists class=agent
-   / family=llm_browser_agent / target_app / stealth on each row.
+  3. Every browser request carries the X-Cernis-* label headers via the
+     Playwright BrowserContext, so the capture proxy persists
+     class=agent / family=llm_<backend>_<model_slug> / target_app /
+     stealth on each row.
 
-4. Per-session provenance is POSTed to the proxy's /__provenance once
-   the session cookie is minted, recording the LLM model + browser-use
-   version in `extra`.
+  4. Per-session provenance is POSTed to the proxy's /__provenance once
+     the session cookie is minted, recording the LLM model +
+     browser-use version in `extra`.
 
-Required env vars:
+The family name encodes the cell (e.g. `llm_openai_gpt_4o_mini`,
+`llm_anthropic_claude_haiku_4_5`) so existing per_family rollups in
+`benchmark/evaluate.py` automatically surface per-(backend, model)
+breakdowns. The phase 14 eval also adds explicit `per_llm_backend` and
+`per_llm_model_x_target` rollups that key off the `llm_` prefix.
+
+Required env vars (single-cell mode):
   CERNIS_TARGET           e.g. http://capture:8080 (must be allow-listed)
-  OPENAI_API_KEY          if CERNIS_AGENT_BACKEND=openai (default)
-  ANTHROPIC_API_KEY       if CERNIS_AGENT_BACKEND=anthropic
+  OPENAI_API_KEY          if any cell uses backend=openai
+  ANTHROPIC_API_KEY       if any cell uses backend=anthropic
 
 Optional env vars:
+  CERNIS_AGENT_CELLS_FILE path to a JSON file with `{"cells": [...]}`.
+                          When set, drives matrix mode. Each cell's
+                          per-cell env vars (backend/model/stealth/task)
+                          override the single-cell defaults below.
   CERNIS_AGENT_BACKEND    openai | anthropic (default openai)
   CERNIS_AGENT_MODEL      model name (defaults: gpt-4o-mini / claude-haiku-4-5)
-  CERNIS_AGENT_TASK       free-text prompt (default: log in + visit 2 pages)
+  CERNIS_AGENT_TASK       free-text prompt (single-cell mode)
+  CERNIS_AGENT_TASKS_FILE JSON {"target_app": "...", "_default": "..."}
+                          used as fallback when a matrix cell omits
+                          `task` and the built-in default for that
+                          target_app isn't what you want.
   CERNIS_TARGET_APP       label (default dvwa)
-  CERNIS_SESSIONS         independent sessions to run (default 1)
+  CERNIS_SESSIONS         independent sessions per cell (default 1)
   CERNIS_STEALTH          1/true → stealth axis on the manifest (default false)
-  CERNIS_AGENT_DRY_RUN    1 → skip the actual browser run (smoke-test hook)
+  CERNIS_AGENT_DRY_RUN    1 → skip browser run; emit cell plan to
+                          /tmp/cernis_real_agent_dry_run.jsonl. Used by
+                          the smoke; also useful to enumerate what a
+                          cells_file would actually run before paying
+                          API budget.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import os
+import pathlib
+import re
 import sys
 import time
+from typing import Optional
 
 sys.path.insert(0, "/app/shared")
 from manifest import (  # noqa: E402
     build_payload, headers_for, record_provenance_playwright,
 )
-from target_guard import get_target  # noqa: E402
+from target_guard import assert_loopback_target, get_target  # noqa: E402
 
-# target_guard exits non-zero (before any LLM import) if CERNIS_TARGET
-# is missing or points off the allow-list. This is the *only* control
-# preventing an injected/jailbroken prompt from steering the browser
-# anywhere besides the bundled targets.
-LABEL = "llm_browser_agent"
-TARGET = get_target()
-TARGET_APP = os.environ.get("CERNIS_TARGET_APP", "dvwa")
-SECURITY_LEVEL = os.environ.get("DVWA_SECURITY_LEVEL", "low")
-SESSIONS = int(os.environ.get("CERNIS_SESSIONS", "1"))
-STEALTH = os.environ.get("CERNIS_STEALTH", "false").strip().lower() in (
-    "1", "true", "yes",
-)
+GENERATOR_NAME = "real_agent"
+GENERATOR_VERSION = "0.2.0"  # phase 14: matrix-cell runner
+
 DRY_RUN = os.environ.get("CERNIS_AGENT_DRY_RUN", "").strip() == "1"
+DRY_RUN_LOG = pathlib.Path(
+    os.environ.get("CERNIS_DRY_RUN_LOG",
+                   "/tmp/cernis_real_agent_dry_run.jsonl")
+)
 
-BACKEND = os.environ.get("CERNIS_AGENT_BACKEND", "openai").strip().lower()
 _DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
 }
-MODEL = os.environ.get("CERNIS_AGENT_MODEL") or _DEFAULT_MODELS.get(BACKEND, "")
 
-DEFAULT_TASK = (
-    f"Open {TARGET}. Log in with username `admin` and password `password`. "
-    f"After login, visit two pages in the navigation menu, then stop."
-)
-TASK = os.environ.get("CERNIS_AGENT_TASK") or DEFAULT_TASK
+_VALID_BACKENDS = frozenset({"openai", "anthropic"})
 
+# Per-target default task templates. `{target}` is substituted at
+# cell-run time. VAmPI is intentionally absent — the JSON-only API has
+# no DOM, so a browser-use agent against it adds zero detection signal
+# beyond what the existing sqlmap / raw_httpx generators already give.
+# A dedicated HTTP-only LLM client for VAmPI is a phase-14-followup
+# item.
+_DEFAULT_TASKS: dict[str, str] = {
+    "dvwa": (
+        "Open {target}. Log in with username `admin` and password "
+        "`password`. After login, visit two pages in the navigation "
+        "menu, then stop."
+    ),
+    "juice_shop": (
+        "Open {target}. Register a fresh account with a throwaway "
+        "email + password, log in, then browse three product pages "
+        "and add one item to the basket."
+    ),
+    "webgoat": (
+        "Open {target}/WebGoat/start.mvc. Register a fresh account "
+        "with a throwaway email + password, log in, then open the "
+        "lesson menu and navigate to two different lessons."
+    ),
+    "crapi": (
+        "Open {target}. Sign up for a new account, log in, then "
+        "browse the vehicles page and the community forum page."
+    ),
+}
+
+
+# ----------------------------------------------------------------------
+# Cell model
+# ----------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class AgentCell:
+    target_url: str         # full URL passed to assert_loopback_target
+    target_app: str         # label persisted in the manifest
+    backend: str            # openai | anthropic
+    model: str              # e.g. gpt-4o-mini
+    stealth: bool
+    sessions: int
+    task: str               # final task string after default-substitution
+    security_level: str = "low"
+
+    def family(self) -> str:
+        return _family_name(self.backend, self.model)
+
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(s: str) -> str:
+    """Lowercase + non-alnum-collapse — turns `gpt-4o-mini` into
+    `gpt_4o_mini`, `claude-haiku-4-5` into `claude_haiku_4_5`."""
+    return _SLUG_RE.sub("_", s.lower()).strip("_")
+
+
+def _family_name(backend: str, model: str) -> str:
+    """Family naming convention for LLM-agent sessions. Keeps the `llm_`
+    prefix so the eval rollup can pivot on it; encodes both backend and
+    model so the existing per_family rollup gives per-cell visibility
+    without any schema change."""
+    return f"llm_{_slug(backend)}_{_slug(model)}"
+
+
+# ----------------------------------------------------------------------
+# Cell-file loading + defaults
+# ----------------------------------------------------------------------
+
+def _tasks_overlay() -> dict[str, str]:
+    """Load CERNIS_AGENT_TASKS_FILE if set. Format:
+       {"target_app": "task ...", "_default": "task ..."}
+    Returns {} on any error so the built-in _DEFAULT_TASKS still
+    govern.
+    """
+    path = os.environ.get("CERNIS_AGENT_TASKS_FILE", "").strip()
+    if not path:
+        return {}
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[real_agent] CERNIS_AGENT_TASKS_FILE unreadable "
+              f"({type(exc).__name__}); falling back to defaults",
+              flush=True)
+        return {}
+
+
+def _resolve_task(
+    target_app: str, target_url: str,
+    explicit: Optional[str], overlay: dict[str, str],
+) -> str:
+    """Pick the task for one cell. Precedence: explicit `task` on the
+    cell > overlay file's per-target entry > built-in default >
+    overlay's `_default` > built-in DVWA default."""
+    if explicit:
+        return explicit.replace("{target}", target_url)
+    if target_app in overlay:
+        return overlay[target_app].replace("{target}", target_url)
+    if target_app in _DEFAULT_TASKS:
+        return _DEFAULT_TASKS[target_app].replace("{target}", target_url)
+    if "_default" in overlay:
+        return overlay["_default"].replace("{target}", target_url)
+    return _DEFAULT_TASKS["dvwa"].replace("{target}", target_url)
+
+
+def _truthy(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def _build_cells_from_env() -> list[AgentCell]:
+    """Single-cell mode: build exactly one cell from the legacy env
+    vars (back-compat with phase-bench-1)."""
+    target = get_target()
+    target_app = os.environ.get("CERNIS_TARGET_APP", "dvwa")
+    backend = os.environ.get("CERNIS_AGENT_BACKEND", "openai").strip().lower()
+    model = os.environ.get("CERNIS_AGENT_MODEL") or _DEFAULT_MODELS.get(backend, "")
+    stealth = _truthy(os.environ.get("CERNIS_STEALTH"))
+    sessions = int(os.environ.get("CERNIS_SESSIONS", "1"))
+    explicit_task = os.environ.get("CERNIS_AGENT_TASK") or None
+    overlay = _tasks_overlay()
+    sec = os.environ.get("DVWA_SECURITY_LEVEL", "low")
+    return [AgentCell(
+        target_url=target, target_app=target_app,
+        backend=backend, model=model, stealth=stealth, sessions=sessions,
+        task=_resolve_task(target_app, target, explicit_task, overlay),
+        security_level=sec,
+    )]
+
+
+def _build_cells_from_file(path: pathlib.Path) -> list[AgentCell]:
+    """Matrix mode: load `{"cells": [...]}` and validate each entry."""
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or "cells" not in raw:
+        raise SystemExit(
+            f"[real_agent] {path} must be a JSON object with a 'cells' list"
+        )
+    overlay = _tasks_overlay()
+    cells: list[AgentCell] = []
+    for i, item in enumerate(raw["cells"]):
+        if not isinstance(item, dict):
+            raise SystemExit(f"[real_agent] cells[{i}] is not a dict")
+        try:
+            target_url = assert_loopback_target(str(item["target_url"]))
+            target_app = str(item["target_app"])
+            backend = str(item["backend"]).strip().lower()
+        except KeyError as exc:
+            raise SystemExit(
+                f"[real_agent] cells[{i}] missing required field: {exc}"
+            )
+        if backend not in _VALID_BACKENDS:
+            raise SystemExit(
+                f"[real_agent] cells[{i}] backend={backend!r} not in "
+                f"{sorted(_VALID_BACKENDS)}"
+            )
+        model = str(item.get("model") or _DEFAULT_MODELS[backend])
+        stealth = _truthy(item.get("stealth"))
+        sessions = int(item.get("sessions", 1))
+        task = _resolve_task(
+            target_app, target_url,
+            explicit=item.get("task"), overlay=overlay,
+        )
+        sec = str(item.get("security_level", "low"))
+        cells.append(AgentCell(
+            target_url=target_url, target_app=target_app,
+            backend=backend, model=model, stealth=stealth,
+            sessions=sessions, task=task, security_level=sec,
+        ))
+    return cells
+
+
+def build_cells() -> list[AgentCell]:
+    """Dispatch on CERNIS_AGENT_CELLS_FILE: matrix mode if set, else
+    single-cell mode reading the legacy env vars."""
+    cells_file = os.environ.get("CERNIS_AGENT_CELLS_FILE", "").strip()
+    if cells_file:
+        path = pathlib.Path(cells_file)
+        if not path.exists():
+            raise SystemExit(
+                f"[real_agent] CERNIS_AGENT_CELLS_FILE={path} does not exist"
+            )
+        return _build_cells_from_file(path)
+    return _build_cells_from_env()
+
+
+# ----------------------------------------------------------------------
+# API key + browser-use version helpers (deferred imports)
+# ----------------------------------------------------------------------
 
 def _api_key_for(backend: str) -> str:
     """Read the API key without ever putting it through stdout/stderr."""
     if backend == "openai":
         key = os.environ.get("OPENAI_API_KEY", "")
+        var = "OPENAI_API_KEY"
     elif backend == "anthropic":
         key = os.environ.get("ANTHROPIC_API_KEY", "")
+        var = "ANTHROPIC_API_KEY"
     else:
-        print(f"[real_agent] unknown CERNIS_AGENT_BACKEND={backend!r}", file=sys.stderr)
+        print(f"[real_agent] unknown backend {backend!r}", file=sys.stderr)
         raise SystemExit(2)
     if not key:
-        var = "OPENAI_API_KEY" if backend == "openai" else "ANTHROPIC_API_KEY"
-        print(f"[real_agent] required env var {var} is not set", file=sys.stderr)
+        print(f"[real_agent] required env var {var} is not set",
+              file=sys.stderr)
         raise SystemExit(2)
     return key
 
@@ -105,57 +341,60 @@ def _browser_use_version() -> str:
         return "unimported"
 
 
-async def _run_one() -> None:
-    """Run a single agent session. Lazy-imports browser-use + langchain
-    so module import (and target_guard validation) stay cheap and
-    decoupled from the heavy LLM/browser stack."""
-    payload = build_payload(
+# ----------------------------------------------------------------------
+# Cell execution
+# ----------------------------------------------------------------------
+
+def _payload_for(cell: AgentCell) -> dict:
+    return build_payload(
         klass="agent",
-        family=LABEL,
-        target_app=TARGET_APP,
-        security_level=SECURITY_LEVEL,
-        stealth=STEALTH,
-        generator="real_agent",
-        generator_version="0.1.0",
+        family=cell.family(),
+        target_app=cell.target_app,
+        security_level=cell.security_level,
+        stealth=cell.stealth,
+        generator=GENERATOR_NAME,
+        generator_version=GENERATOR_VERSION,
         generator_config={
-            "backend": BACKEND, "model": MODEL, "stealth": STEALTH,
+            "backend": cell.backend, "model": cell.model,
+            "stealth": cell.stealth, "target_app": cell.target_app,
         },
         extra={
-            "backend": BACKEND,
-            "model": MODEL,
+            "backend": cell.backend,
+            "model": cell.model,
             "framework": "browser-use",
             "framework_version": _browser_use_version(),
+            "prompt_template_id": _slug(cell.target_app),
         },
     )
+
+
+async def _run_one_session(cell: AgentCell, payload: dict) -> None:
+    """One agent session against one cell. Heavy imports happen here so
+    the dry-run + sanity paths don't drag the playwright/browser-use
+    deps in."""
     extra_headers = headers_for(payload)
 
     from browser_use import Agent, BrowserSession  # noqa: PLC0415
-
-    api_key = _api_key_for(BACKEND)
-    if BACKEND == "openai":
+    api_key = _api_key_for(cell.backend)
+    if cell.backend == "openai":
         from langchain_openai import ChatOpenAI  # noqa: PLC0415
-        llm = ChatOpenAI(model=MODEL, api_key=api_key)
+        llm = ChatOpenAI(model=cell.model, api_key=api_key)
     else:
         from langchain_anthropic import ChatAnthropic  # noqa: PLC0415
-        llm = ChatAnthropic(model=MODEL, api_key=api_key)
-    # api_key is in the closed-over llm now; drop our local reference
-    # so it can't accidentally end up in a logged traceback.
+        llm = ChatAnthropic(model=cell.model, api_key=api_key)
     del api_key
 
-    session = BrowserSession(
-        extra_http_headers=extra_headers,
-        headless=True,
-    )
-    agent = Agent(task=TASK, llm=llm, browser_session=session)
+    session = BrowserSession(extra_http_headers=extra_headers, headless=True)
+    agent = Agent(task=cell.task, llm=llm, browser_session=session)
     try:
         await agent.run()
-        # Provenance row: post it from the same browser context so the
-        # cernis_sid cookie travels with it and keys correctly.
         try:
             ctx = getattr(session, "context", None)
             ctx_request = getattr(ctx, "request", None) if ctx else None
             if ctx_request is not None:
-                await record_provenance_playwright(ctx_request, TARGET, payload)
+                await record_provenance_playwright(
+                    ctx_request, cell.target_url, payload,
+                )
         except Exception as exc:  # noqa: BLE001 — provenance is best-effort
             print(
                 f"[real_agent] provenance post skipped: {type(exc).__name__}",
@@ -168,34 +407,63 @@ async def _run_one() -> None:
             pass
 
 
-async def main() -> None:
-    print(
-        f"[real_agent] target={TARGET} backend={BACKEND} model={MODEL} "
-        f"sessions={SESSIONS} stealth={STEALTH} dry_run={DRY_RUN}",
-        flush=True,
+async def _run_cell(cell: AgentCell) -> None:
+    payload = _payload_for(cell)
+    label = (
+        f"target={cell.target_app}({cell.target_url}) "
+        f"backend={cell.backend} model={cell.model} "
+        f"stealth={cell.stealth} sessions={cell.sessions} "
+        f"family={cell.family()}"
     )
+    print(f"[real_agent] cell  {label}", flush=True)
+
     if DRY_RUN:
+        DRY_RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with DRY_RUN_LOG.open("a") as f:
+            f.write(json.dumps({
+                "cell": dataclasses.asdict(cell),
+                "payload": payload,
+                "headers": headers_for(payload),
+            }, sort_keys=True) + "\n")
         print(
-            "[real_agent] CERNIS_AGENT_DRY_RUN=1 set — skipping browser run "
-            "(target_guard already validated; no LLM call made)",
+            f"[real_agent]   DRY_RUN: logged payload + headers to "
+            f"{DRY_RUN_LOG}, no LLM call made",
             flush=True,
         )
         return
-    for i in range(SESSIONS):
+
+    for i in range(cell.sessions):
         t0 = time.time()
         try:
-            await _run_one()
+            await _run_one_session(cell, payload)
             print(
-                f"[real_agent] session {i + 1}/{SESSIONS} ok in {time.time() - t0:.1f}s",
+                f"[real_agent]   session {i + 1}/{cell.sessions} ok "
+                f"in {time.time() - t0:.1f}s",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001
-            # Don't include the exception args in the log line — some
-            # LLM clients echo the api key back in error messages.
+            # Don't echo exc args — some LLM clients put the api key
+            # in their error messages.
             print(
-                f"[real_agent] session {i + 1}/{SESSIONS} failed: {type(exc).__name__}",
+                f"[real_agent]   session {i + 1}/{cell.sessions} failed: "
+                f"{type(exc).__name__}",
                 flush=True,
             )
+
+
+async def main() -> None:
+    cells = build_cells()
+    print(
+        f"[real_agent] phase 14 matrix runner v{GENERATOR_VERSION} "
+        f"n_cells={len(cells)} dry_run={DRY_RUN}",
+        flush=True,
+    )
+    if DRY_RUN and DRY_RUN_LOG.exists():
+        # Truncate the log so a fresh dry-run starts clean. The smoke
+        # depends on knowing it has only the rows from this invocation.
+        DRY_RUN_LOG.unlink()
+    for cell in cells:
+        await _run_cell(cell)
 
 
 if __name__ == "__main__":

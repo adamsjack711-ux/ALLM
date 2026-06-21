@@ -601,14 +601,30 @@ services:
     profiles: ["crapi"]
     restart: unless-stopped
 
-  # ── phase-bench-1: real autonomous LLM browser agent ────────────────
+  # ── phase-bench-1 + phase 14: real autonomous LLM browser agent ─────
   # The ONLY lab component that talks to a cloud API. Gated behind its
   # own `real-agent` profile so it does not start under the default
-  # `docker compose up`. Bring up with:
+  # `docker compose up`. API key comes from .env (gitignored). The bot
+  # enforces target_guard's allow-list before any LLM call, so an
+  # injected prompt can't reach off-lab targets.
+  #
+  # SINGLE-CELL MODE (phase-bench-1, the legacy default):
   #     docker compose --profile real-agent up --build real_agent
-  # API key comes from .env (gitignored). The bot enforces
-  # CERNIS_TARGET against target_guard's allow-list before any LLM
-  # call, so an injected prompt can't reach off-lab targets.
+  # uses CERNIS_TARGET + CERNIS_TARGET_APP + CERNIS_AGENT_BACKEND +
+  # CERNIS_AGENT_MODEL + CERNIS_STEALTH for one cell.
+  #
+  # MATRIX MODE (phase 14): set CERNIS_AGENT_CELLS_FILE to the
+  # container path of a JSON `{"cells": [{...}, ...]}` file.
+  # `orchestrator/sweep.py --include-llm` writes that file to
+  # ./data/llm_cells.json; the bind mount below exposes it at
+  # /data/llm_cells.json. Each cell's URL is re-validated through
+  # target_guard before any LLM is contacted, so a malformed cells
+  # file can't escape the allow-list.
+  #
+  # DRY-RUN: CERNIS_AGENT_DRY_RUN=1 prints what each cell would do
+  # and writes the payload + X-Cernis-* headers to
+  # /tmp/cernis_real_agent_dry_run.jsonl. No LLM is called. Use this
+  # to verify a cells_file before paying API budget.
 
   real_agent:
     build:
@@ -624,6 +640,14 @@ services:
       CERNIS_AGENT_BACKEND: ${CERNIS_AGENT_BACKEND:-openai}
       CERNIS_AGENT_MODEL: ${CERNIS_AGENT_MODEL:-gpt-4o-mini}
       CERNIS_STEALTH: "false"
+      CERNIS_AGENT_CELLS_FILE: ${CERNIS_AGENT_CELLS_FILE:-}
+      CERNIS_AGENT_DRY_RUN: ${CERNIS_AGENT_DRY_RUN:-}
+      CERNIS_AGENT_TASKS_FILE: ${CERNIS_AGENT_TASKS_FILE:-}
+    volumes:
+      # Read-only bind for cells_file + per-target tasks overlay. The
+      # sweep orchestrator writes ./data/llm_cells.json which the bot
+      # consumes at /data/llm_cells.json inside the container.
+      - ./data:/data:ro
     depends_on:
       - capture
     networks: [cernis_lab]

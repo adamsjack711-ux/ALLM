@@ -35,6 +35,7 @@ import datetime as dt
 import json
 import pathlib
 import random
+import re
 import sys
 import time
 from typing import Optional
@@ -187,6 +188,103 @@ def _per_target_app(
             "n_agent_truth": sum(1 for y, _ in rows if y == 1),
             "n_benign_truth": sum(1 for y, _ in rows if y == 0),
         }
+    return out
+
+
+# Phase 14: real-LLM agent rollups. The `real_agent` generator names
+# families `llm_<backend>_<model_slug>` (e.g. `llm_openai_gpt_4o_mini`,
+# `llm_anthropic_claude_haiku_4_5`) so the existing `_per_family` rollup
+# already surfaces per-(backend × model) numbers. The two functions
+# below pivot on that prefix to give explicit per-backend and
+# per-(backend × model × target_app) rollups — much easier for a
+# consumer to read than scanning a long per_family table.
+_LLM_FAMILY_RE = re.compile(r"^llm_(openai|anthropic)_(.+)$")
+
+
+def _parse_llm_family(fam: str) -> Optional[tuple[str, str]]:
+    """`llm_<backend>_<model_slug>` → (backend, model_slug), else None."""
+    if not isinstance(fam, str):
+        return None
+    m = _LLM_FAMILY_RE.match(fam)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _per_llm_backend(
+    truth: dict[str, dict], scores_by_sid: dict[str, float], threshold: float,
+) -> dict[str, dict]:
+    """Per-backend aggregate over all LLM-agent sessions. Returns
+    `{}` when no `llm_*` families are present in the truth (no schema
+    cost when LLM cells haven't been run yet)."""
+    by_backend: dict[str, list[tuple[int, int]]] = {}
+    by_backend_targets: dict[str, set[str]] = {}
+    by_backend_models: dict[str, set[str]] = {}
+    for sid, t in truth.items():
+        parsed = _parse_llm_family(t.get("family") or "")
+        if parsed is None:
+            continue
+        backend, model_slug = parsed
+        pred = 1 if scores_by_sid.get(sid, 0.0) >= threshold else 0
+        by_backend.setdefault(backend, []).append((int(t["y"]), pred))
+        by_backend_targets.setdefault(backend, set()).add(
+            t.get("target_app") or "?"
+        )
+        by_backend_models.setdefault(backend, set()).add(model_slug)
+    out: dict[str, dict] = {}
+    for backend, rows in by_backend.items():
+        n = len(rows)
+        n_alert = sum(p for _, p in rows)
+        n_pos = sum(1 for y, _ in rows if y == 1)
+        n_recall_num = sum(p for y, p in rows if y == 1)
+        out[backend] = {
+            "n": n,
+            "alerts": n_alert,
+            "alert_rate": n_alert / max(n, 1),
+            "n_agent_truth": n_pos,
+            "recall": n_recall_num / n_pos if n_pos else None,
+            "n_target_apps": len(by_backend_targets.get(backend, set())),
+            "n_models": len(by_backend_models.get(backend, set())),
+        }
+    return out
+
+
+def _per_llm_model_x_target(
+    truth: dict[str, dict], scores_by_sid: dict[str, float], threshold: float,
+) -> dict[str, dict]:
+    """Per-(backend × model_slug × target_app) breakdown for LLM-agent
+    sessions. Empty dict when no `llm_*` families are present.
+
+    Key shape: `"<backend>/<model_slug>/<target_app>"` — string-keyed
+    so the JSON stays consumer-friendly (nested dicts here would force
+    every reader to traverse three levels for a single number)."""
+    out: dict[str, dict] = {}
+    for sid, t in truth.items():
+        parsed = _parse_llm_family(t.get("family") or "")
+        if parsed is None:
+            continue
+        backend, model_slug = parsed
+        target_app = t.get("target_app") or "?"
+        key = f"{backend}/{model_slug}/{target_app}"
+        pred = 1 if scores_by_sid.get(sid, 0.0) >= threshold else 0
+        cell = out.setdefault(key, {
+            "n": 0, "alerts": 0, "n_agent_truth": 0,
+            "n_recall_numerator": 0, "stealth_seen": False,
+        })
+        cell["n"] += 1
+        cell["alerts"] += pred
+        if int(t["y"]) == 1:
+            cell["n_agent_truth"] += 1
+            if pred:
+                cell["n_recall_numerator"] += 1
+        if t.get("stealth"):
+            cell["stealth_seen"] = True
+    for key, cell in out.items():
+        n_pos = cell["n_agent_truth"]
+        cell["alert_rate"] = cell["alerts"] / max(cell["n"], 1)
+        cell["recall"] = (
+            cell["n_recall_numerator"] / n_pos if n_pos else None
+        )
+        # Drop the intermediate accumulator before serialization
+        del cell["n_recall_numerator"]
     return out
 
 
@@ -539,6 +637,12 @@ def run_eval(
         "primary": primary,
         "per_family": _per_family(truth, scores_by_sid, threshold),
         "per_target_app": _per_target_app(truth, scores_by_sid, threshold),
+        "per_llm_backend": _per_llm_backend(
+            truth, scores_by_sid, threshold,
+        ),
+        "per_llm_model_x_target": _per_llm_model_x_target(
+            truth, scores_by_sid, threshold,
+        ),
         "agent_vs_benign_bot": _agent_vs_benign_bot(
             truth, scores_by_sid, threshold,
         ),

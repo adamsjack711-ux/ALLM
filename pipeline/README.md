@@ -20,13 +20,28 @@ range itself is out of scope for this sandbox (which blocks
 ```
 pipeline/
 ├── caldera_op_to_labels.py   # CALDERA op JSON -> Steps + malicious_guids
+├── atomic_to_labels.py       # Atomic Red Team invocations -> labels (phase 2)
 ├── ingest_sysmon.py          # Sysmon dump -> normalized DataFrame
 ├── provenance_host.py        # data/host/manifest.jsonl writer
-├── synth_caldera.py          # in-sandbox synthetic campaign generator
 ├── score_campaign.py         # the orchestrator (ingest -> score -> emit)
+├── score_heldout_emulation.py # held-out emulation-family eval (phase 2)
+├── alert_fatigue.py          # window-rate FP/hour arithmetic (phase 3)
+│                             #   + --multi-day + --deployments-file (phase 4)
+├── calibrate_eventrate.py    # real-Sysmon → deployments.json (phase 4)
+├── COLLECTOR_TUNING.md       # operator cookbook (phase 4)
+├── synth_caldera.py          # synthetic CALDERA campaign
+├── synth_atomic.py           # synthetic Atomic campaign        (phase 2)
+├── synth_workload.py         # synthetic normal-workload campaign (phase 2)
+├── synth_hard_negatives.py   # synthetic hard-negative bursts   (phase 2)
+├── smoke.py                  # phase 1 smoke
+├── smoke_phase2.py           # phase 2 smoke
+├── smoke_phase3.py           # phase 3 smoke
+├── smoke_phase4.py           # phase 4 smoke
 └── README.md                 # this file
 data/host/
 ├── manifest.jsonl            # append-only provenance, one row per campaign
+├── alert_fatigue.json        # window-rate arithmetic output (phase 3+4)
+├── deployments.json          # calibrated deployment shapes  (phase 4)
 └── <campaign_id>/
     ├── sysmon.jsonl          # range collector dump (you drop this)
     ├── caldera_op.json       # CALDERA op report (you drop this)
@@ -464,15 +479,130 @@ The output gives you, **at the budget you can actually staff**:
 
 ### What phase 3 explicitly does *not* do
 
-- **Multi-day campaign aggregation.** Each campaign is still one op
-  or one shift. Spanning days for the same campaign needs either
-  longer windows or a different group key.
-- **WEC / winlogbeat collector tuning docs.** Configuration is
-  environment-specific; the tooling produces correct arithmetic
-  regardless of which collector feeds the JSONL.
+- ~~Multi-day campaign aggregation.~~ **Phase 4 ships this** —
+  see the section below.
+- ~~WEC / winlogbeat collector tuning docs.~~ **Phase 4 ships
+  `COLLECTOR_TUNING.md`** — operator-facing Sysmon exclusion guidance
+  + expected per-host rate ranges + per-EID FP attribution recipe.
 - **Auto-discovery of `bursts_per_host_per_day`.** The defaults are
   hand-calibrated against synth; production deployments should
   measure their own via the runbook count described above.
+
+## Phase 4 — real-data calibration, multi-day aggregation, collector tuning
+
+Phase 3 produced defensible arithmetic with synthetic-derived per-host
+event rates and hand-tuned deployment shapes. Phase 4 closes the gap to
+real deployments along three axes.
+
+### Calibrate against real Sysmon (`pipeline/calibrate_eventrate.py`)
+
+Read-only: load any Sysmon dump (JSONL / CSV / Parquet), measure the
+combined per-host event rate plus per-minute burst distribution, emit
+a `deployments.json` that `alert_fatigue --deployments-file` consumes
+in place of the built-in `DEFAULT_DEPLOYMENTS`.
+
+```sh
+python3 -m pipeline.calibrate_eventrate \
+    --sysmon /path/to/sysmon.jsonl \
+    --hosts-per-deployment "10,50,200" \
+    --out data/host/deployments.json
+```
+
+The output includes:
+
+- `events_per_sec_per_host.overall` — steady-state rate.
+- `events_per_sec_per_host.minute_bucket_p50` / `p95` — burst
+  spread. The gap between these is your burstiness budget.
+- `per_eid` — share of total events per Sysmon EID, ranked. The
+  top-3 EIDs usually account for >80% of volume; that's where
+  collector tuning has the most leverage.
+- `deployments` — suggested shapes ready for `alert_fatigue`.
+
+### Multi-day partition (`alert_fatigue --multi-day`)
+
+Single-day FP/hour estimates hide diurnal swings. With `--multi-day`,
+`alert_fatigue` partitions eval campaigns by the UTC date of their
+`ts_start` and emits, at the **same** fitted τ, per-day per-class FP
+rate plus per-deployment FP/hour distribution (median / p95 / min /
+max) across days.
+
+```sh
+python3 -m pipeline.alert_fatigue \
+    --deployments-file data/host/deployments.json \
+    --fp-budget 1.0 \
+    --multi-day
+```
+
+τ stays fixed by design: jittering the threshold day-to-day would
+hide the FP-rate drift the operator is trying to see. What varies
+day-to-day is the *realized* per-window FP rate, and therefore the
+FP/hour the operator would pay at a constant alarm budget.
+
+The new `daily` block in `alert_fatigue.json`:
+
+```jsonc
+"daily": {
+  "days": [
+    {"date": "2026-06-19", "n_campaigns": 2,
+     "per_class_fp_rate": {...},
+     "per_hard_negative_subtype_fp_rate": {...},
+     "deployment_estimates": [...]},
+    ...
+  ],
+  "deployment_distribution": [
+    {"deployment": "calibrated_med_business_50h",
+     "n_days": 3,
+     "median_total_fp_per_hour": 0.42,
+     "p95_total_fp_per_hour": 1.18,
+     "min_total_fp_per_hour": 0.21,
+     "max_total_fp_per_hour": 1.20}
+  ]
+}
+```
+
+A 2× or wider spread between median and p95 is the signal that a
+point-estimate is misleading and the threshold's safety margin is
+smaller than it looks.
+
+### Collector tuning cookbook (`pipeline/COLLECTOR_TUNING.md`)
+
+Operator-facing doc covering:
+
+- Expected per-host event-rate ranges by workstation class (kiosk /
+  office / dev / build host / DC / file server).
+- Noisy-EID list (10, 12/13/14, 22, 23, 5) with concrete Sysmon
+  exclusion-stanza XML snippets.
+- Per-EID FP attribution: how to combine `calibrate_eventrate`'s
+  `per_eid.share` with `alert_fatigue`'s `per_class_fp_rate.normal`
+  to rank which EIDs to filter first.
+- Burst-shape encoding workflow for sanctioned activity that doesn't
+  match the five built-in subtypes.
+- Multi-day calibration discipline: ≥7 days before pinning
+  production thresholds; re-calibrate when the daily median-vs-p95
+  spread exceeds 2×.
+
+### Smoke
+
+```sh
+python3 -m pipeline.smoke_phase4    # no docker, no real Sysmon
+```
+
+Stages the phase-host-2 synth set, re-stamps `ts_start` values to
+span 3 distinct UTC dates, runs calibrate → `--deployments-file` →
+`--multi-day`, and asserts each output's shape (per-EID share,
+suggested deployments, daily distribution, populated min / median /
+p95 / max stats).
+
+### What phase 4 explicitly does *not* do
+
+- **Automatic Sysmon config edits.** Exclusion-stanza XML is supplied;
+  deploying it through GPO / config management is still manual.
+- **Per-EID FP attribution at window granularity.** The cookbook
+  gives an approximation from per-EID share × per-window FP rate.
+  Exact attribution requires windowized inference over per-EID-only
+  campaigns — phase-host-5 scope.
+- **On-host agent threshold deployment.** The arithmetic is offline;
+  pushing the picked τ to a running detector is out of scope here.
 
 ## What phase 1 explicitly does *not* do (historical)
 

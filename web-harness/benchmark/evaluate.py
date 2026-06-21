@@ -509,6 +509,13 @@ def main() -> int:
     ap.add_argument("--splits-dir", type=pathlib.Path,
                     default=ROOT / "benchmark" / "splits" / splitmod.SPLITS_VERSION)
     ap.add_argument("--data", type=pathlib.Path, default=ROOT / "data")
+    ap.add_argument(
+        "--features-jsonl", type=pathlib.Path, default=None,
+        help="Public release mode: load sessions from this features.jsonl "
+             "instead of detector.features.build_sessions(--data). Must be "
+             "paired with --truth-jsonl.",
+    )
+    ap.add_argument("--truth-jsonl", type=pathlib.Path, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fp-per-hour-budget", type=float, default=1.0)
     ap.add_argument("--out", type=pathlib.Path, default=None)
@@ -519,6 +526,18 @@ def main() -> int:
         / f"bench_{args.split}_{args.submission.name}_seed{args.seed}"
     )
 
+    sessions = None
+    if args.features_jsonl or args.truth_jsonl:
+        if not (args.features_jsonl and args.truth_jsonl):
+            print(
+                "[evaluate] --features-jsonl and --truth-jsonl must both be set",
+                file=sys.stderr,
+            )
+            return 2
+        sessions = contractmod.sessions_from_features_jsonl(
+            args.features_jsonl, args.truth_jsonl,
+        )
+
     results = run_eval(
         submission_dir=args.submission,
         split=args.split,
@@ -527,6 +546,7 @@ def main() -> int:
         seed=args.seed,
         fp_per_hour_budget=args.fp_per_hour_budget,
         out_dir=out_dir,
+        sessions=sessions,
     )
     print((out_dir / "report.txt").read_text(), end="")
     print(f"[evaluate] wrote {out_dir / 'results.json'}")

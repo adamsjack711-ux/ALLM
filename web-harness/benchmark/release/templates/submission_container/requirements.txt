@@ -1,0 +1,3 @@
+# Reference submission has zero third-party deps. Add yours here; the
+# Dockerfile pip-installs them before COPY of submission.py so layer
+# cache is reused when only the model code changes.

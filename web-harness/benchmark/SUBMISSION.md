@@ -6,8 +6,16 @@ the public training features, calls `predict()` on the evaluation split's
 features, joins the returned scores with the held-back truth, and emits
 the metric suite.
 
-This phase ships the **Python entrypoint** flavor only. A container
-flavor (`docker run --network none`) is planned for a follow-up phase.
+Two flavors are supported:
+
+- **Python entrypoint** (the default) — the harness imports your
+  `submission.py` in-process. Fastest iteration; trust-based.
+- **Container** (`--container-image <tag>`) — the harness runs your
+  pre-built docker image with `--network none --read-only` and other
+  isolation flags. Use when you want quantitative resource accounting
+  on the leaderboard, or when you want to ship a submission that
+  bundles non-Python deps (CUDA, system libraries, etc.). See the
+  *Container flavor* section below for the contract.
 
 ## Required interface
 
@@ -98,16 +106,109 @@ threshold from the score distribution and the FP/hour budget.
 
 ## What the harness does NOT do
 
-- **Network isolation.** The Python entrypoint flavor does not sandbox
-  the submission. Don't write a submission that fetches a model from
-  the internet at predict-time — your numbers will not be comparable
-  across runs. The planned container flavor will enforce
-  `--network none`; until then this is an honor system.
+- **Network isolation in the Python flavor.** The Python entrypoint
+  flavor does not sandbox the submission. Don't write a submission that
+  fetches a model from the internet at predict-time — your numbers
+  will not be comparable across runs. Use `--container-image` if you
+  want enforced `--network none` (see *Container flavor* below).
 - **GPU.** Submissions run on the same machine that runs the eval. If
   you need a GPU, train one elsewhere and ship the weights inside your
   submission dir.
 - **Multi-process.** `predict` is called once with the full feature
   list. Parallelize internally if you like.
+
+## Container flavor
+
+Use when you want enforced isolation, deterministic dep resolution, or
+quantitative resource accounting on the leaderboard.
+
+### Template
+
+`benchmark/release/templates/submission_container/` is the working
+starting point. It ships:
+
+```
+submission_container/
+├── Dockerfile       # python:3.12-slim + your deps
+├── requirements.txt # add yours here
+├── runner.py        # I/O wrapper — DO NOT EDIT
+├── submission.py    # YOUR predict() (+ optional train())
+└── README.md        # local build/test instructions
+```
+
+Copy the directory, replace `submission.py` with your model, edit
+`requirements.txt` for deps, then:
+
+```sh
+docker build -t my-cernis-submission /path/to/submission_container
+make eval-container SUBMISSION=benchmark/baselines/ua_rule SUBMISSION_IMAGE=my-cernis-submission
+```
+
+### Contract
+
+The runner bind-mounts:
+
+```
+/in/eval_features.jsonl    one feature dict per line (read-only)
+/in/train_features.jsonl   optional; present when the harness has
+                           training splits and your submission defines
+                           train()
+/in/dev_features.jsonl     optional; same conditions as train_features
+/out/                      your scores.jsonl goes here
+```
+
+Your container's `submission.py` defines the same `predict()` (+
+optional `train()`) as the Python flavor. `runner.py` reads the JSONL,
+calls into your submission, writes `/out/scores.jsonl`. Don't edit it.
+
+### Isolation
+
+The harness runs your image with:
+
+```
+docker run --rm --network=none --read-only \
+    --tmpfs /tmp:rw,size=512m \
+    --memory=4g --cpus=2 \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    -v <in>:/in:ro -v <out>:/out:rw \
+    your-image
+```
+
+`--network none` is the load-bearing one: no fetching models or
+phoning home at predict-time. Bake everything into the image.
+
+`--memory` and `--cpus` are configurable via `--container-memory` /
+`--container-cpus` on the eval CLI. Default 4 GB / 2 CPUs.
+
+### Resource accounting
+
+The container flavor measures:
+
+- `wall_time_s` — monotonic-clock end-to-end.
+- `peak_mem_mb` — best-effort via background `docker stats` polling
+  during the run (may be slightly under the true peak between polls).
+- `exit_status` — container exit code. 124 = timed out.
+
+These land on the leaderboard alongside PR-AUC and FP/hour, so a
+submission that hits the same PR-AUC at a fraction of the wall-time
+ranks accordingly.
+
+## Leaderboard
+
+```sh
+# append to leaderboard.jsonl every time you eval
+make eval SUBMISSION=benchmark/baselines/hybrid LEADERBOARD=data/reports/leaderboard.jsonl
+
+# regenerate the deduped markdown rollup
+python3 -m benchmark.leaderboard --leaderboard data/reports/leaderboard.jsonl
+```
+
+The leaderboard JSONL is append-only. Dedup is by
+`(submission_hash, splits_version, split, seed)` — re-running the same
+code overwrites the previous score in the rollup. `submission_hash` is
+SHA-256 over the submission directory's regular file contents
+(excluding `__pycache__/` and `.DS_Store`), so byte-identical code
+produces byte-identical hashes.
 
 ## What the metric suite looks like
 

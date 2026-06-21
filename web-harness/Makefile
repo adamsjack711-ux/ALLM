@@ -12,8 +12,9 @@ SPLITS   ?= benchmark/splits/v1
 FP_BUDGET ?= 1.0
 SPLIT    ?= public_test
 LEADERBOARD ?= data/reports/leaderboard.jsonl
+DASHBOARD_PORT ?= 8095
 
-.PHONY: help build-splits eval eval-heldout eval-container leaderboard smoke-bench smoke-bench-4
+.PHONY: help build-splits eval eval-heldout eval-container leaderboard smoke-bench smoke-bench-4 dashboard smoke-dashboard
 
 help:
 	@echo "Cernis benchmark targets:"
@@ -26,9 +27,12 @@ help:
 	@echo "  make leaderboard                           # regenerate leaderboard.md"
 	@echo "  make smoke-bench                           # run the phase-bench-2 smoke"
 	@echo "  make smoke-bench-4                         # run the phase-bench-4 smoke"
+	@echo "  make dashboard                             # serve the live dashboard on 127.0.0.1:8095"
+	@echo "  make smoke-dashboard                       # run the phase-15 smoke"
 	@echo ""
 	@echo "Overrides: DATA=$(DATA)  SEED=$(SEED)  SPLITS=$(SPLITS)  FP_BUDGET=$(FP_BUDGET)"
 	@echo "Leaderboard: LEADERBOARD=$(LEADERBOARD)"
+	@echo "Dashboard: DASHBOARD_PORT=$(DASHBOARD_PORT)"
 
 build-splits:
 	$(PYTHON) -m benchmark.build_splits \
@@ -74,3 +78,9 @@ smoke-bench:
 
 smoke-bench-4:
 	$(PYTHON) tests/phase_bench_4_smoke.py
+
+dashboard:
+	$(PYTHON) -m dashboard.app --data-dir $(DATA) --port $(DASHBOARD_PORT)
+
+smoke-dashboard:
+	$(PYTHON) tests/phase15_smoke.py

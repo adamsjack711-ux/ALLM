@@ -653,6 +653,26 @@ services:
     networks: [cernis_lab]
     profiles: ["real-agent"]
 
+  # ── phase 15: live operator dashboard ──────────────────────────────
+  # Tails sessions.jsonl + requests.jsonl + leaderboard.jsonl +
+  # alert_fatigue.json and renders three panels. Read-only — never
+  # writes to data/, never triggers an eval. Gated behind its own
+  # `dashboard` profile so it does not start under the default
+  # `docker compose up`. Bring up alongside generators / benigns:
+  #     docker compose --profile dashboard up -d dashboard
+  # Then open http://127.0.0.1:8095. Bound to loopback only.
+
+  dashboard:
+    build: ./dashboard
+    container_name: cernis_dashboard
+    volumes:
+      - ./data:/data:ro
+    ports:
+      - "127.0.0.1:8095:8095"
+    networks: [cernis_lab]
+    profiles: ["dashboard"]
+    restart: unless-stopped
+
 networks:
   cernis_lab:
     name: cernis_lab

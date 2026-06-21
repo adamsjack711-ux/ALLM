@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
 import json
 import pathlib
 import sys
@@ -139,6 +140,38 @@ class WindowScores:
     scores: np.ndarray        # per-window risk
     labels: np.ndarray        # per-window 0/1 ground truth
     ts_first: float           # earliest window ts for MTTD
+
+
+def load_deployments_file(path: pathlib.Path) -> list[dict]:
+    """Load a deployments JSON file produced by `pipeline.calibrate_eventrate`
+    (or hand-written). Format: list of {name, hosts, events_per_sec_per_host}.
+    Raises SystemExit with a readable message on malformed input.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise SystemExit(f"[alert_fatigue] deployments file not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[alert_fatigue] deployments file {path} is not JSON: {exc}")
+    if isinstance(raw, dict) and "deployments" in raw:
+        raw = raw["deployments"]
+    if not isinstance(raw, list) or not raw:
+        raise SystemExit(
+            f"[alert_fatigue] deployments file {path} must be a non-empty list "
+            f"of {{name, hosts, events_per_sec_per_host}}")
+    out: list[dict] = []
+    for i, item in enumerate(raw):
+        try:
+            out.append({
+                "name": str(item["name"]),
+                "hosts": int(item["hosts"]),
+                "events_per_sec_per_host": float(item["events_per_sec_per_host"]),
+            })
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SystemExit(
+                f"[alert_fatigue] deployments[{i}] missing/bad field: {exc}; "
+                f"got {item!r}")
+    return out
 
 
 def _train_and_score(
@@ -316,6 +349,104 @@ def _fp_per_hour_estimate(
 
 
 # ----------------------------------------------------------------------
+# Multi-day partitioning
+# ----------------------------------------------------------------------
+
+def _utc_date(ts: float) -> str:
+    """Unix seconds → ISO `YYYY-MM-DD` in UTC. ts==0 falls back to 'unknown'
+    so unlabeled campaigns bucket into a single visible bucket instead of
+    silently aliasing to 1970-01-01."""
+    if not ts or ts <= 0:
+        return "unknown"
+    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _per_day_deployment_estimates(
+    eval_blocks: list[WindowScores],
+    tau: float,
+    deployments: list[dict],
+    burst_shapes: dict,
+    campaign_day: dict[str, str],
+) -> dict:
+    """Partition eval blocks by the UTC date of the campaign's ts_start,
+    then for each day re-run `_per_window_fp_rates` + `_fp_per_hour_estimate`
+    at the SAME fixed τ that was picked over the whole eval set.
+
+    τ stays fixed by design: jittering the threshold day-to-day would hide
+    the very FP-rate drift we're trying to surface. What varies day-to-day
+    is the *realized* per-window FP rate (and therefore FP/hour) the
+    operator would see at a constant alarm budget.
+
+    Returns:
+      {
+        "days": [
+            {
+              "date": "YYYY-MM-DD",
+              "n_campaigns": int,
+              "per_class_fp_rate": {...},
+              "per_hard_negative_subtype_fp_rate": {...},
+              "deployment_estimates": [...],
+            }, ...
+        ],
+        "deployment_distribution": [
+            {
+              "deployment": str,
+              "n_days": int,
+              "median_total_fp_per_hour": float,
+              "p95_total_fp_per_hour": float,
+              "min_total_fp_per_hour": float,
+              "max_total_fp_per_hour": float,
+            }, ...
+        ],
+      }
+    """
+    by_day: dict[str, list[WindowScores]] = {}
+    for wb in eval_blocks:
+        day = campaign_day.get(wb.campaign_id, "unknown")
+        by_day.setdefault(day, []).append(wb)
+
+    day_entries: list[dict] = []
+    per_deployment_totals: dict[str, list[float]] = {d["name"]: [] for d in deployments}
+    for day in sorted(by_day):
+        blocks = by_day[day]
+        per_class, per_sub = _per_window_fp_rates(blocks, tau)
+        estimates = _fp_per_hour_estimate(per_class, per_sub, deployments, burst_shapes)
+        for est in estimates:
+            per_deployment_totals[est["deployment"]].append(est["total_fp_per_hour"])
+        day_entries.append({
+            "date": day,
+            "n_campaigns": len({b.campaign_id for b in blocks}),
+            "per_class_fp_rate": per_class,
+            "per_hard_negative_subtype_fp_rate": per_sub,
+            "deployment_estimates": estimates,
+        })
+
+    distribution: list[dict] = []
+    for dep in deployments:
+        vals = per_deployment_totals.get(dep["name"], [])
+        if not vals:
+            distribution.append({
+                "deployment": dep["name"], "n_days": 0,
+                "median_total_fp_per_hour": None,
+                "p95_total_fp_per_hour": None,
+                "min_total_fp_per_hour": None,
+                "max_total_fp_per_hour": None,
+            })
+            continue
+        arr = np.asarray(vals, dtype=float)
+        distribution.append({
+            "deployment": dep["name"],
+            "n_days": int(arr.size),
+            "median_total_fp_per_hour": float(np.median(arr)),
+            "p95_total_fp_per_hour": float(np.percentile(arr, 95)),
+            "min_total_fp_per_hour": float(arr.min()),
+            "max_total_fp_per_hour": float(arr.max()),
+        })
+
+    return {"days": day_entries, "deployment_distribution": distribution}
+
+
+# ----------------------------------------------------------------------
 # Orchestration
 # ----------------------------------------------------------------------
 
@@ -326,6 +457,7 @@ def run(
     deployments: list[dict],
     burst_shapes: dict,
     train_frac: float = 0.75,
+    multi_day: bool = False,
 ) -> dict:
     manifest = provenance_host.load(data_root / "manifest.jsonl")
     if not manifest:
@@ -422,7 +554,7 @@ def run(
         per_class_fp, per_subtype_fp, deployments, burst_shapes,
     )
 
-    return {
+    report = {
         "fp_per_hour_budget": fp_per_hour_budget,
         "threshold": tau,
         "train_campaigns": train_cids,
@@ -436,6 +568,17 @@ def run(
         "burst_shapes_used": burst_shapes,
     }
 
+    if multi_day:
+        campaign_day = {
+            cid: _utc_date(float(meta_by_cid.get(cid, {}).get("ts_start", 0.0)))
+            for cid in eval_cids
+        }
+        report["daily"] = _per_day_deployment_estimates(
+            blocks, tau, deployments, burst_shapes, campaign_day,
+        )
+
+    return report
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
@@ -448,11 +591,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="single deployment override: number of hosts")
     ap.add_argument("--event-rate", type=float, default=None,
                     help="single deployment override: events/sec/host")
+    ap.add_argument("--deployments-file", type=pathlib.Path, default=None,
+                    help="JSON file with [{name, hosts, events_per_sec_per_host}] "
+                         "from pipeline.calibrate_eventrate or hand-written. "
+                         "Overrides --hosts/--event-rate and the built-in defaults.")
+    ap.add_argument("--multi-day", action="store_true",
+                    help="partition eval campaigns by UTC ts_start day and emit "
+                         "per-day per-class FP rate + per-deployment FP/hour "
+                         "distribution (median/p95/min/max) at the fixed τ.")
     ap.add_argument("--out", type=pathlib.Path,
                     default=pathlib.Path("data/host/alert_fatigue.json"))
     args = ap.parse_args(argv)
 
-    if args.hosts is not None and args.event_rate is not None:
+    if args.deployments_file is not None:
+        deployments = load_deployments_file(args.deployments_file)
+    elif args.hosts is not None and args.event_rate is not None:
         deployments = [{
             "name": f"custom_{args.hosts}h_{args.event_rate}eps",
             "hosts": args.hosts,
@@ -464,6 +617,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run(
         args.data_root, args.fp_budget, args.seed,
         deployments=deployments, burst_shapes=DEFAULT_BURST_SHAPES,
+        multi_day=args.multi_day,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))
@@ -496,6 +650,28 @@ def main(argv: list[str] | None = None) -> int:
               f"total={est['total_fp_per_hour']:.2f}/h  "
               f"(normal={est['normal_fp_per_hour']:.2f} + "
               f"hard_neg={est['hard_negative_fp_per_hour']:.2f})")
+
+    if "daily" in report:
+        days = report["daily"]["days"]
+        print()
+        print(f"  multi-day partition: {len(days)} day-buckets at fixed τ")
+        for entry in days:
+            normal = entry["per_class_fp_rate"].get("normal", {})
+            fp_rate = normal.get("fp_rate")
+            fp_rate_s = f"{fp_rate:.4f}" if fp_rate is not None else "n/a"
+            print(f"    {entry['date']}  campaigns={entry['n_campaigns']:<2}  "
+                  f"normal fp_rate={fp_rate_s}")
+        print()
+        print("  per-deployment FP/hour distribution across days:")
+        for d in report["daily"]["deployment_distribution"]:
+            if d["n_days"] == 0:
+                print(f"    {d['deployment']:>18}  no days")
+                continue
+            print(f"    {d['deployment']:>18}  n_days={d['n_days']:<2}  "
+                  f"median={d['median_total_fp_per_hour']:.2f}/h  "
+                  f"p95={d['p95_total_fp_per_hour']:.2f}/h  "
+                  f"min={d['min_total_fp_per_hour']:.2f}  "
+                  f"max={d['max_total_fp_per_hour']:.2f}")
     return 0
 
 

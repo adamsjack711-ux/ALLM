@@ -72,6 +72,16 @@ def main() -> int:
         "--n-heldout-families", type=int,
         default=splitmod.DEFAULT_HELDOUT_FAMILIES,
     )
+    ap.add_argument(
+        "--heldout-super-family", default=None,
+        help="phase-bench-5: hold out ALL agent sessions belonging to "
+             "this super-family. For LLM-agent families "
+             "(`llm_<backend>_<model_slug>`) the super-family is the "
+             "backend (e.g. `openai` or `anthropic`); for everything "
+             "else it's the family name itself. Pass `openai` to "
+             "measure cross-backend generalization by training public "
+             "splits on Anthropic + non-LLM agents only.",
+    )
     args = ap.parse_args()
 
     if not args.data.exists():
@@ -89,6 +99,7 @@ def main() -> int:
         metas, seed=args.seed,
         n_heldout_families=args.n_heldout_families,
         source_data_sha256=source_hash,
+        heldout_super_family=args.heldout_super_family,
     )
 
     splitmod.assert_family_disjoint(split_set)
@@ -104,6 +115,13 @@ def main() -> int:
         )
     print(f"  heldout agent families: {split_set.manifest['agent_families_heldout']}")
     print(f"  stealth holdout families: {split_set.manifest['stealth_holdout_families']}")
+    if split_set.manifest.get("heldout_super_family"):
+        sf = split_set.manifest["heldout_super_family"]
+        sf_fams = split_set.manifest["heldout_super_family_families"]
+        print(
+            f"  heldout super-family: {sf} "
+            f"({len(sf_fams)} constituent families: {sf_fams})"
+        )
     return 0
 
 

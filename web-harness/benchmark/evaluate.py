@@ -626,6 +626,30 @@ def run_eval(
         primary["n_heldout_family_positives"] = len(ho_pos_sids)
         primary["n_heldout_stealth_positives"] = len(ho_stealth_pos_sids)
 
+        # phase-bench-5: when the splits MANIFEST records a
+        # heldout_super_family, the cross-backend generalization
+        # numbers are exactly the heldout_family numbers above (the
+        # super-family's sessions ARE the held-out positives). Surface
+        # them as their own keys so consumers don't have to read the
+        # manifest to know what's being measured.
+        manifest_path = splits_dir / "MANIFEST.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except json.JSONDecodeError:
+                manifest = {}
+            sf = manifest.get("heldout_super_family")
+            if sf:
+                primary["heldout_super_family"] = sf
+                primary["heldout_super_family_pr_auc"] = heldout_family_pr_auc
+                primary["heldout_super_family_recall_at_budget"] = (
+                    heldout_family_recall
+                )
+                primary["n_heldout_super_family_positives"] = len(ho_pos_sids)
+                primary["heldout_super_family_families"] = list(
+                    manifest.get("heldout_super_family_families", [])
+                )
+
     results = {
         "split": split,
         "seed": seed,

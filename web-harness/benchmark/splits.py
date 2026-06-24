@@ -31,11 +31,33 @@ import hashlib
 import json
 import pathlib
 import random
-from typing import Iterable
+import re
+from typing import Iterable, Optional
 
 SPLITS_VERSION = "v1"
 DEFAULT_HELDOUT_FAMILIES = 2
 DEFAULT_PUBLIC_RATIOS = (0.6, 0.2, 0.2)  # train / dev / test
+
+
+# Phase 14 family naming convention: `llm_<backend>_<model_slug>`.
+# `super_family(fam)` returns the backend name for those, the family
+# itself for everything else. The cross-backend held-out split
+# (phase-bench-5) is implemented as `hold out everything whose
+# super_family == X`.
+_LLM_FAMILY_RE = re.compile(r"^llm_(openai|anthropic)_(.+)$")
+
+
+def super_family(family: Optional[str]) -> str:
+    """Map a family to its super-family (the cross-cutting bucket the
+    heldout split uses). For `llm_<backend>_<model_slug>` families the
+    super-family is `<backend>`; for everything else it's the family
+    name itself (so non-LLM families behave exactly as before).
+
+    Returns "" for empty / None input."""
+    if not family:
+        return ""
+    m = _LLM_FAMILY_RE.match(family)
+    return m.group(1) if m else family
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,19 +171,29 @@ def build_split_set(
     public_ratios: tuple[float, float, float] = DEFAULT_PUBLIC_RATIOS,
     source_data_sha256: str | None = None,
     built_at: str | None = None,
+    heldout_super_family: Optional[str] = None,
 ) -> SplitSet:
     """Build the full split set.
 
     Algorithm:
-      1. Pick `n_heldout_families` agent families deterministically.
-         All their sessions go to `private_heldout_family`.
-      2. From the remaining (public) agent families, identify those
+      1. If `heldout_super_family` is set (e.g. "openai"), ALL agent
+         sessions whose family maps to that super-family go to
+         `private_heldout_family`. The remaining families are then
+         eligible for the standard per-family holdout step.
+      2. Pick `n_heldout_families` agent families deterministically
+         from the eligible (non-super-family-heldout) families. Their
+         sessions also go to `private_heldout_family`.
+      3. From the remaining (public) agent families, identify those
          that have BOTH stealth=true and stealth=false sessions; their
          stealth=true sessions go to `private_heldout_stealth`. Their
          stealth=false sessions stay in the public pool.
-      3. Everything else (non-heldout-family + non-heldout-stealth) is
-         the public pool. Deterministic shuffle + 60/20/20 partition
-         into public_{train, dev, test}.
+      4. Everything else is the public pool. Deterministic shuffle +
+         60/20/20 partition into public_{train, dev, test}.
+
+    `heldout_super_family` is the phase-bench-5 cross-backend
+    generalization knob — pass "openai" to train the public splits on
+    only Anthropic LLM-agent sessions (plus all non-LLM agents) and
+    measure detection on the held-out OpenAI ones.
     """
     by_id = {s.session_id: s for s in sessions}
     if len(by_id) != len(sessions):
@@ -169,9 +201,29 @@ def build_split_set(
             "duplicate session_id in input — splits cannot be deterministic"
         )
 
-    agent_families = sorted({s.family for s in sessions if s.klass == "agent" and s.family})
-    heldout_families = _pick_heldout_families(agent_families, seed, n_heldout_families)
-    heldout_family_set = set(heldout_families)
+    # Step 1: super-family holdout (phase-bench-5)
+    if heldout_super_family:
+        super_family_heldout_families = sorted({
+            s.family for s in sessions
+            if s.klass == "agent" and s.family
+            and super_family(s.family) == heldout_super_family
+        })
+        super_family_heldout_family_set = set(super_family_heldout_families)
+    else:
+        super_family_heldout_families = []
+        super_family_heldout_family_set = set()
+
+    # Step 2: standard per-family holdout, over the families NOT already
+    # held out by the super-family rule
+    eligible_agent_families = sorted({
+        s.family for s in sessions
+        if s.klass == "agent" and s.family
+        and s.family not in super_family_heldout_family_set
+    })
+    heldout_families = _pick_heldout_families(
+        eligible_agent_families, seed, n_heldout_families,
+    )
+    heldout_family_set = set(heldout_families) | super_family_heldout_family_set
 
     heldout_family_ids = sorted(
         s.session_id for s in sessions if s.family in heldout_family_set
@@ -214,8 +266,13 @@ def build_split_set(
             {s.family for s in sessions
              if s.klass == "agent" and s.family not in heldout_family_set}
         ),
-        "agent_families_heldout": heldout_families,
+        "agent_families_heldout": sorted(heldout_family_set),
         "stealth_holdout_families": stealth_holdout_families,
+        # phase-bench-5: cross-backend held-out super-family. None when
+        # the standard family-only holdout is used. Read by evaluate.py
+        # to expose heldout_super_family_* metrics.
+        "heldout_super_family": heldout_super_family,
+        "heldout_super_family_families": super_family_heldout_families,
         "splits": {},
     }
     for name, ids in (

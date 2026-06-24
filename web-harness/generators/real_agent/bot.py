@@ -108,13 +108,34 @@ from manifest import (  # noqa: E402
 from target_guard import assert_loopback_target, get_target  # noqa: E402
 
 GENERATOR_NAME = "real_agent"
-GENERATOR_VERSION = "0.2.0"  # phase 14: matrix-cell runner
+GENERATOR_VERSION = "0.3.0"  # phase 14b: per-session cost accounting
 
 DRY_RUN = os.environ.get("CERNIS_AGENT_DRY_RUN", "").strip() == "1"
 DRY_RUN_LOG = pathlib.Path(
     os.environ.get("CERNIS_DRY_RUN_LOG",
                    "/tmp/cernis_real_agent_dry_run.jsonl")
 )
+
+
+def _dry_run_tokens() -> tuple[int, int]:
+    """Phase 14b: spoofed token counts for the smoke. Format is
+    `<input>/<output>` integers; returns (0, 0) when unset so the
+    legacy dry-run path stays unchanged. The smoke uses this to
+    verify the cost-accounting pipeline without an LLM call."""
+    raw = os.environ.get("CERNIS_DRY_RUN_TOKENS", "").strip()
+    if not raw or "/" not in raw:
+        return 0, 0
+    a, b = raw.split("/", 1)
+    try:
+        return int(a), int(b)
+    except ValueError:
+        return 0, 0
+
+
+# Local pricing module (sibling file). Import is at module-load time;
+# pricing is a pure-Python dict + helpers with no third-party deps.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pricing as pricingmod  # noqa: E402
 
 _DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
@@ -345,7 +366,17 @@ def _browser_use_version() -> str:
 # Cell execution
 # ----------------------------------------------------------------------
 
-def _payload_for(cell: AgentCell) -> dict:
+def _payload_for(cell: AgentCell, *, tokens_in: int = 0, tokens_out: int = 0) -> dict:
+    """Build the per-session provenance payload.
+
+    `tokens_in` / `tokens_out` come from the per-session
+    TokenCounterCallback after the agent.run() returns. In DRY_RUN
+    they come from `CERNIS_DRY_RUN_TOKENS=<in>/<out>` so the smoke
+    can verify the cost-accounting pipeline without an LLM call.
+    """
+    cost_cents = pricingmod.estimate_cost_cents(
+        cell.backend, cell.model, tokens_in, tokens_out,
+    )
     return build_payload(
         klass="agent",
         family=cell.family(),
@@ -364,36 +395,86 @@ def _payload_for(cell: AgentCell) -> dict:
             "framework": "browser-use",
             "framework_version": _browser_use_version(),
             "prompt_template_id": _slug(cell.target_app),
+            # phase 14b: per-session cost accounting. cost_cents is
+            # None for unpriced (backend, model) pairs; the dashboard
+            # renders that as 'unpriced'.
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "estimated_cost_cents": cost_cents,
         },
     )
 
 
-async def _run_one_session(cell: AgentCell, payload: dict) -> None:
+class _TokenCounter:
+    """Async langchain BaseCallbackHandler that sums prompt_tokens +
+    completion_tokens across every LLM call inside one session.
+
+    Defined inline (rather than imported from a top-level class) so the
+    bot module can load without langchain installed — the smoke + the
+    dry-run path don't touch this code at all."""
+
+    def __init__(self) -> None:
+        self.tokens_in = 0
+        self.tokens_out = 0
+
+    def _accumulate(self, response) -> None:
+        llm_output = getattr(response, "llm_output", None) or {}
+        usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+        # OpenAI uses prompt_tokens / completion_tokens; Anthropic uses
+        # input_tokens / output_tokens. Honor both keys.
+        self.tokens_in += int(
+            usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+        )
+        self.tokens_out += int(
+            usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+        )
+
+    async def on_llm_end(self, response, **kwargs) -> None:  # noqa: D401
+        self._accumulate(response)
+
+    async def on_chat_model_end(self, response, **kwargs) -> None:  # noqa: D401
+        self._accumulate(response)
+
+
+async def _run_one_session(cell: AgentCell) -> None:
     """One agent session against one cell. Heavy imports happen here so
     the dry-run + sanity paths don't drag the playwright/browser-use
-    deps in."""
-    extra_headers = headers_for(payload)
+    deps in.
+
+    The X-Cernis-* request headers are built from a token-less payload
+    (the capture proxy only needs class/family/target/stealth on each
+    row). The per-session provenance row posted at the end carries the
+    actual token counts captured by `_TokenCounter`.
+    """
+    base_payload = _payload_for(cell)  # for request headers only
+    extra_headers = headers_for(base_payload)
 
     from browser_use import Agent, BrowserSession  # noqa: PLC0415
     api_key = _api_key_for(cell.backend)
+    counter = _TokenCounter()
     if cell.backend == "openai":
         from langchain_openai import ChatOpenAI  # noqa: PLC0415
-        llm = ChatOpenAI(model=cell.model, api_key=api_key)
+        llm = ChatOpenAI(model=cell.model, api_key=api_key, callbacks=[counter])
     else:
         from langchain_anthropic import ChatAnthropic  # noqa: PLC0415
-        llm = ChatAnthropic(model=cell.model, api_key=api_key)
+        llm = ChatAnthropic(model=cell.model, api_key=api_key, callbacks=[counter])
     del api_key
 
     session = BrowserSession(extra_http_headers=extra_headers, headless=True)
     agent = Agent(task=cell.task, llm=llm, browser_session=session)
     try:
         await agent.run()
+        # Build the provenance payload AFTER the agent finishes so we
+        # can attach the realized token counts + estimated cost.
+        prov_payload = _payload_for(
+            cell, tokens_in=counter.tokens_in, tokens_out=counter.tokens_out,
+        )
         try:
             ctx = getattr(session, "context", None)
             ctx_request = getattr(ctx, "request", None) if ctx else None
             if ctx_request is not None:
                 await record_provenance_playwright(
-                    ctx_request, cell.target_url, payload,
+                    ctx_request, cell.target_url, prov_payload,
                 )
         except Exception as exc:  # noqa: BLE001 — provenance is best-effort
             print(
@@ -408,16 +489,22 @@ async def _run_one_session(cell: AgentCell, payload: dict) -> None:
 
 
 async def _run_cell(cell: AgentCell) -> None:
-    payload = _payload_for(cell)
+    projection = pricingmod.estimate_session_projection(cell.backend, cell.model)
     label = (
         f"target={cell.target_app}({cell.target_url}) "
         f"backend={cell.backend} model={cell.model} "
         f"stealth={cell.stealth} sessions={cell.sessions} "
-        f"family={cell.family()}"
+        f"family={cell.family()} "
+        f"projected_cost={pricingmod.format_cents(projection * cell.sessions if projection is not None else None)}"
     )
     print(f"[real_agent] cell  {label}", flush=True)
 
     if DRY_RUN:
+        # phase 14b: honor spoofed token counts via CERNIS_DRY_RUN_TOKENS=<in>/<out>
+        # so the smoke can verify the cost-accounting pipeline without an LLM
+        # call. The legacy dry-run path (no env var) still writes zero tokens.
+        tokens_in, tokens_out = _dry_run_tokens()
+        payload = _payload_for(cell, tokens_in=tokens_in, tokens_out=tokens_out)
         DRY_RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with DRY_RUN_LOG.open("a") as f:
             f.write(json.dumps({
@@ -427,7 +514,9 @@ async def _run_cell(cell: AgentCell) -> None:
             }, sort_keys=True) + "\n")
         print(
             f"[real_agent]   DRY_RUN: logged payload + headers to "
-            f"{DRY_RUN_LOG}, no LLM call made",
+            f"{DRY_RUN_LOG}, no LLM call made"
+            + (f" (spoofed tokens {tokens_in}/{tokens_out})"
+               if (tokens_in or tokens_out) else ""),
             flush=True,
         )
         return
@@ -435,7 +524,7 @@ async def _run_cell(cell: AgentCell) -> None:
     for i in range(cell.sessions):
         t0 = time.time()
         try:
-            await _run_one_session(cell, payload)
+            await _run_one_session(cell)
             print(
                 f"[real_agent]   session {i + 1}/{cell.sessions} ok "
                 f"in {time.time() - t0:.1f}s",

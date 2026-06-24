@@ -68,10 +68,12 @@ def tail_sessions(
 ) -> list[dict]:
     """Return the last `n` provenance rows from sessions.jsonl, newest
     first. Truncates each row's `extra` field to avoid shipping
-    multi-KB blobs to the browser."""
+    multi-KB blobs to the browser, but pulls the phase-14b cost
+    fields out as top-level keys so the dashboard can render them."""
     rows = read_jsonl(sessions_path, max_lines=max(n * 4, 1000))[-n:]
     trimmed = []
     for r in reversed(rows):
+        extra = r.get("extra") or {}
         trimmed.append({
             "ts": r.get("ts"),
             "session_id": r.get("session_id"),
@@ -81,9 +83,71 @@ def tail_sessions(
             "security_level": r.get("security_level"),
             "stealth": bool(r.get("stealth")),
             "generator": r.get("generator"),
-            "extra_keys": sorted((r.get("extra") or {}).keys()),
+            "extra_keys": sorted(extra.keys()),
+            # Phase 14b: surface cost fields when present.
+            "tokens_in": extra.get("tokens_in"),
+            "tokens_out": extra.get("tokens_out"),
+            "estimated_cost_cents": extra.get("estimated_cost_cents"),
         })
     return trimmed
+
+
+# ── phase 14b: LLM spend rollup ─────────────────────────────────────
+
+
+def llm_spend_summary(
+    sessions_path: pathlib.Path, *, window_s: float = 86400.0,
+    now: Optional[float] = None,
+) -> dict:
+    """Sum `extra.estimated_cost_cents` across `llm_*` family sessions
+    in the last `window_s` seconds (default 24h). Returns total +
+    per-(backend, model) breakdown + an `unpriced_sessions` count for
+    rows whose (backend, model) wasn't in the pricing table.
+
+    Used by the dashboard's header spend-badge and the phase 14b
+    smoke."""
+    now = now if now is not None else time.time()
+    cutoff = now - window_s
+    rows = read_jsonl(sessions_path, max_lines=200000)
+    total_cents = 0.0
+    n_sessions = 0
+    unpriced = 0
+    by_pair: dict[str, dict] = {}
+    for r in rows:
+        ts = float(r.get("ts") or 0)
+        if ts < cutoff:
+            continue
+        fam = r.get("family") or ""
+        if not fam.startswith("llm_"):
+            continue
+        extra = r.get("extra") or {}
+        backend = extra.get("backend") or "?"
+        model = extra.get("model") or "?"
+        key = f"{backend}/{model}"
+        cell = by_pair.setdefault(key, {
+            "backend": backend, "model": model,
+            "n_sessions": 0, "tokens_in": 0, "tokens_out": 0,
+            "cost_cents": 0.0, "unpriced": False,
+        })
+        cell["n_sessions"] += 1
+        cell["tokens_in"] += int(extra.get("tokens_in") or 0)
+        cell["tokens_out"] += int(extra.get("tokens_out") or 0)
+        cents = extra.get("estimated_cost_cents")
+        if cents is None:
+            cell["unpriced"] = True
+            unpriced += 1
+        else:
+            cell["cost_cents"] += float(cents)
+            total_cents += float(cents)
+        n_sessions += 1
+    return {
+        "window_s": window_s,
+        "n_sessions": n_sessions,
+        "unpriced_sessions": unpriced,
+        "total_cents": total_cents,
+        "total_dollars": total_cents / 100.0,
+        "by_backend_model": by_pair,
+    }
 
 
 def sessions_by_family(
@@ -824,6 +888,12 @@ def make_app(
             assert_no_accuracy(payload, source="sweep")
         return web.json_response(payload)
 
+    async def api_llm_spend(request):
+        window_s = float(request.query.get("window_s", "86400"))
+        payload = llm_spend_summary(sessions_path, window_s=window_s)
+        assert_no_accuracy(payload, source="llm_spend")
+        return web.json_response(payload)
+
     app = web.Application()
     app.add_routes([
         web.get("/", index),
@@ -835,6 +905,7 @@ def make_app(
         web.get("/api/leaderboard", api_leaderboard),
         web.get("/api/alert_fatigue", api_alert_fatigue),
         web.get("/api/sweep", api_sweep),
+        web.get("/api/llm_spend", api_llm_spend),
     ])
     return app
 

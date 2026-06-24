@@ -226,6 +226,54 @@ def default_llm_config(
     return cells
 
 
+def cost_projection_for_cells(cells: Iterable[LlmSweepCell]) -> dict:
+    """Phase 14b: pre-run cost projection across the LLM matrix.
+
+    Sums DEFAULT_TOKENS_PER_SESSION × per-cell session count × public
+    list pricing per (backend, model). Returns the per-cell breakdown
+    plus total + an `unpriced_cells` list so the operator sees which
+    (backend, model) pairs weren't in the pricing table.
+
+    The projection is deliberately conservative — meant as an upper-
+    bound sanity check before paying budget, NOT an accountant's
+    invoice. Actual per-session cost is captured at provenance time
+    and aggregated by the dashboard.
+    """
+    # Lazy import: the orchestrator runs outside the generator
+    # container, so the pricing module lives under a sibling path.
+    pricing_path = ROOT / "generators" / "real_agent"
+    if str(pricing_path) not in sys.path:
+        sys.path.insert(0, str(pricing_path))
+    import pricing as pricingmod  # type: ignore
+
+    per_cell: list[dict] = []
+    total_cents = 0.0
+    unpriced: list[str] = []
+    for c in cells:
+        per_session = pricingmod.estimate_session_projection(c.backend, c.model)
+        cell_cents = (per_session * c.sessions) if per_session is not None else None
+        per_cell.append({
+            "target_app": c.target_app,
+            "backend": c.backend,
+            "model": c.model,
+            "stealth": c.stealth,
+            "sessions": c.sessions,
+            "estimated_cost_cents_per_session": per_session,
+            "estimated_cost_cents_total": cell_cents,
+        })
+        if cell_cents is None:
+            unpriced.append(f"{c.backend}/{c.model}")
+        else:
+            total_cents += cell_cents
+    return {
+        "default_tokens_per_session": pricingmod.DEFAULT_TOKENS_PER_SESSION,
+        "per_cell": per_cell,
+        "total_cents": total_cents,
+        "total_formatted": pricingmod.format_cents(total_cents),
+        "unpriced_cells": sorted(set(unpriced)),
+    }
+
+
 def write_llm_cells_file(
     cells: Iterable[LlmSweepCell], path: pathlib.Path,
 ) -> None:
@@ -560,8 +608,15 @@ def main(argv: list[str] | None = None) -> int:
             backends=backends, models=models_override,
             sessions_per_cell=args.llm_sessions,
         )
+        # Phase 14b: pre-run cost projection. Print BEFORE
+        # execute_llm_sweep so the operator sees the bill before
+        # paying (even with --llm-dry-run, this is the value).
+        pre_run_cost = cost_projection_for_cells(llm_cells)
         print(f"[sweep] LLM matrix: {len(llm_cells)} cells "
               f"(backends={list(backends)}, dry_run={args.llm_dry_run})")
+        print(f"[sweep] PROJECTED SPEND: {pre_run_cost['total_formatted']}"
+              + (f"  (unpriced models: {pre_run_cost['unpriced_cells']})"
+                 if pre_run_cost["unpriced_cells"] else ""))
 
     cell_results: list[dict] = []
     if not args.skip_docker:
@@ -576,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     report["config"] = config.to_summary()
     report["cell_run_results"] = cell_results
     if llm_cells:
+        cost = cost_projection_for_cells(llm_cells)
         report["llm_matrix"] = {
             "n_cells": len(llm_cells),
             "axes": {
@@ -585,8 +641,14 @@ def main(argv: list[str] | None = None) -> int:
                 "stealth": sorted({c.stealth for c in llm_cells}),
             },
             "families_planned": sorted({c.family() for c in llm_cells}),
+            "cost_projection": cost,
             "run": llm_run,
         }
+        print(
+            f"[sweep] LLM cost projection: {cost['total_formatted']} "
+            f"(total) across {len(llm_cells)} cells; "
+            f"unpriced: {cost['unpriced_cells'] or 'none'}"
+        )
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = args.out or (REPORTS / f"sweep_{ts}.json")

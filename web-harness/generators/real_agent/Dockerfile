@@ -12,6 +12,7 @@ COPY shared /app/shared
 COPY real_agent/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
 COPY real_agent/bot.py /app/
+COPY real_agent/pricing.py /app/
 
 ENV PYTHONUNBUFFERED=1 \
     CERNIS_TARGET=http://capture:8080 \

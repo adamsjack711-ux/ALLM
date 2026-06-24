@@ -290,6 +290,15 @@ def _run_part_b() -> None:
             "Makefile", "manifest.json",
             "benchmark/contract.py", "benchmark/evaluate.py",
             "benchmark/splits.py", "benchmark/SUBMISSION.md",
+            # phase-bench-6: container submission runner + leaderboard
+            "benchmark/runner_container.py",
+            "benchmark/leaderboard.py",
+            # phase-bench-6: container submission template at root
+            "submission_container/Dockerfile",
+            "submission_container/runner.py",
+            "submission_container/submission.py",
+            "submission_container/requirements.txt",
+            "submission_container/README.md",
             "splits/v1/MANIFEST.json",
             "splits/v1/public_train.json",
             "splits/v1/public_dev.json",
@@ -300,6 +309,15 @@ def _run_part_b() -> None:
             _assert(
                 (out_dir / relpath).exists(),
                 f"[phase-bench-3] release missing expected file: {relpath}",
+            )
+
+        # (B1b) Release Makefile carries the phase-bench-6 targets.
+        mf_text = (out_dir / "Makefile").read_text()
+        for needle in ("eval-container:", "leaderboard:",
+                        "SUBMISSION_IMAGE", "LEADERBOARD"):
+            _assert(
+                needle in mf_text,
+                f"[phase-bench-3] release Makefile missing {needle!r}",
             )
 
         # (B2) NO private_*.json files anywhere in the release.

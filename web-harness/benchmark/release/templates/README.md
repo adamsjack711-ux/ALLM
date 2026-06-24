@@ -23,10 +23,44 @@ make eval SUBMISSION=benchmark/baselines/ua_rule
 
 # Score the in-repo champion (trained on public_train + public_dev)
 make eval SUBMISSION=benchmark/baselines/hybrid
+
+# Append the run to the leaderboard
+make eval SUBMISSION=benchmark/baselines/hybrid LEADERBOARD=data/reports/leaderboard.jsonl
+make leaderboard   # regenerate the deduped + sorted markdown rollup
 ```
 
 Results land in `data/reports/bench_public_test_<name>_seed0/`
 (`results.json` + a readable `report.txt`).
+
+## Submission flavors
+
+- **Python entrypoint** (the default) — the harness imports your
+  `submission.py` in-process. Fastest iteration; trust-based.
+- **Container** (`make eval-container SUBMISSION=<path> SUBMISSION_IMAGE=<tag>`)
+  — the harness runs your pre-built docker image with
+  `--network none --read-only`. Required if you want enforced
+  isolation, deterministic dep resolution, or quantitative resource
+  accounting (wall-time, peak memory) on the leaderboard.
+
+The container template ships under `./submission_container/`:
+copy the directory, edit `submission.py` with your model + add deps
+to `requirements.txt`, `docker build -t my-cernis-submission .`, then
+`make eval-container SUBMISSION=benchmark/baselines/ua_rule SUBMISSION_IMAGE=my-cernis-submission`.
+See `submission_container/README.md` for the full contract.
+
+## Leaderboard
+
+`data/reports/leaderboard.jsonl` is an append-only log of every eval
+run that used `LEADERBOARD=…`. Dedup is by
+`(submission_hash, splits_version, split, seed)` — re-running the same
+code overwrites the previous score in the rollup. `submission_hash` is
+SHA-256 over the submission directory's regular file contents
+(excluding `__pycache__/` and `.DS_Store`), so byte-identical code
+produces byte-identical hashes.
+
+`make leaderboard` regenerates `data/reports/leaderboard.md` with rows
+sorted by PR-AUC desc, grouped by `(splits_version, split, seed)`,
+with PR-AUC / FP-per-hour / wall-time / peak-mem / exit-status columns.
 
 ## What's in this release
 
@@ -37,14 +71,22 @@ Results land in `data/reports/bench_public_test_<name>_seed0/`
   DATASHEET.md       ← Datasheets-for-Datasets data documentation
   LICENSE            ← MIT, code
   LICENSE-DATA       ← CC BY 4.0, data
-  Makefile           ← `make eval SUBMISSION=…`
+  Makefile           ← `make eval`, `make eval-container`, `make leaderboard`
   manifest.json      ← release-level checksums + counts
   benchmark/
-    SUBMISSION.md    ← submission contract (Python entrypoint)
-    contract.py      ← features / truth schema + output validator
-    evaluate.py      ← the eval harness
-    splits.py        ← split-file read + checksum verification
+    SUBMISSION.md         ← submission contract (Python + container flavors)
+    contract.py           ← features / truth schema + output validator
+    evaluate.py           ← the eval harness
+    splits.py             ← split-file read + checksum verification
+    runner_container.py   ← docker --network=none submission runner
+    leaderboard.py        ← append-only leaderboard + markdown rollup
     baselines/<6 baselines>/submission.py
+  submission_container/
+    Dockerfile            ← starting point for a container submission
+    runner.py             ← I/O wrapper (do not edit)
+    submission.py         ← reference floor (replace with your model)
+    requirements.txt
+    README.md             ← container-flavor instructions
   splits/v1/
     MANIFEST.json
     public_train.json   public_dev.json   public_test.json

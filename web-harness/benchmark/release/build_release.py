@@ -69,14 +69,29 @@ _CODE_FILES = (
     "evaluate.py",
     "splits.py",
     "SUBMISSION.md",
+    # phase-bench-6: phase-bench-4's container-submission runner +
+    # append-only leaderboard. Shipping them in the release means
+    # external submitters can use --container-image and
+    # `make leaderboard` without re-deriving the contract.
+    "runner_container.py",
+    "leaderboard.py",
+)
+
+# Phase-bench-6: the container submission template tree. Lives at
+# `benchmark/release/templates/submission_container/` in-repo; the
+# release puts it at `<release>/submission_container/` so submitters
+# discover it next to README.md.
+_SUBMISSION_CONTAINER_FILES = (
+    "Dockerfile", "README.md", "requirements.txt",
+    "runner.py", "submission.py",
 )
 
 # Document templates copied (with substitution) into the release root.
 _DOC_FILES = ("README.md", "TASK.md", "DATASHEET.md", "LICENSE", "LICENSE-DATA")
 
 # What the release's own Makefile knows. Trimmed from web-harness/Makefile:
-# only `eval` (the consumer's primary entry point) and `smoke` (re-runs
-# the in-repo phase-bench-2 smoke against the released benchmark dir).
+# the consumer's primary entry points (`eval`, `eval-container`,
+# `leaderboard`).
 _RELEASE_MAKEFILE = """\
 # Cernis benchmark — release {VERSION}
 #
@@ -87,22 +102,30 @@ PYTHON ?= python3
 SEED ?= 0
 FP_BUDGET ?= 1.0
 SPLIT ?= public_test
+LEADERBOARD ?= data/reports/leaderboard.jsonl
 
-.PHONY: help eval
+.PHONY: help eval eval-container leaderboard
 
 help:
 \t@echo "Cernis benchmark — release {VERSION}"
 \t@echo ""
 \t@echo "  make eval SUBMISSION=<path>                   # eval on public_test"
 \t@echo "  make eval SUBMISSION=<path> SEED=N            # different seed"
+\t@echo "  make eval-container SUBMISSION=<path> SUBMISSION_IMAGE=<tag>"
+\t@echo "                                                # eval via docker --network none"
+\t@echo "  make leaderboard                              # regenerate leaderboard.md"
 \t@echo ""
 \t@echo "Examples:"
 \t@echo "  make eval SUBMISSION=benchmark/baselines/ua_rule"
 \t@echo "  make eval SUBMISSION=benchmark/baselines/aggregate_only"
+\t@echo "  make eval-container SUBMISSION=benchmark/baselines/ua_rule \\\\"
+\t@echo "                      SUBMISSION_IMAGE=my-cernis-submission"
+\t@echo ""
+\t@echo "See ./submission_container/README.md for the container flavor."
 
 eval:
 \t@if [ -z "$(SUBMISSION)" ]; then \\
-\t\techo "usage: make eval SUBMISSION=<path>"; exit 2; \\
+\t\techo "usage: make eval SUBMISSION=<path> [LEADERBOARD=<path>]"; exit 2; \\
 \tfi
 \t$(PYTHON) -m benchmark.evaluate \\
 \t\t--submission $(SUBMISSION) \\
@@ -111,7 +134,27 @@ eval:
 \t\t--splits-dir splits/v1 \\
 \t\t--features-jsonl data/features.jsonl \\
 \t\t--truth-jsonl data/truth.jsonl \\
-\t\t--fp-per-hour-budget $(FP_BUDGET)
+\t\t--fp-per-hour-budget $(FP_BUDGET) \\
+\t\t$(if $(LEADERBOARD),--leaderboard $(LEADERBOARD),)
+
+eval-container:
+\t@if [ -z "$(SUBMISSION)" ] || [ -z "$(SUBMISSION_IMAGE)" ]; then \\
+\t\techo "usage: make eval-container SUBMISSION=<path> SUBMISSION_IMAGE=<docker tag>"; \\
+\t\texit 2; \\
+\tfi
+\t$(PYTHON) -m benchmark.evaluate \\
+\t\t--submission $(SUBMISSION) \\
+\t\t--container-image $(SUBMISSION_IMAGE) \\
+\t\t--split $(SPLIT) \\
+\t\t--seed $(SEED) \\
+\t\t--splits-dir splits/v1 \\
+\t\t--features-jsonl data/features.jsonl \\
+\t\t--truth-jsonl data/truth.jsonl \\
+\t\t--fp-per-hour-budget $(FP_BUDGET) \\
+\t\t$(if $(LEADERBOARD),--leaderboard $(LEADERBOARD),)
+
+leaderboard:
+\t$(PYTHON) -m benchmark.leaderboard --leaderboard $(LEADERBOARD)
 """
 
 # Default placeholder for missing template files (commits 1+2 don't
@@ -172,6 +215,32 @@ def _copy_code_files(src_root: pathlib.Path, dst_root: pathlib.Path) -> list[pat
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(sub.read_bytes())
                 copied.append(dst)
+    return copied
+
+
+def _copy_submission_container(
+    templates_dir: pathlib.Path, dst_root: pathlib.Path,
+) -> list[pathlib.Path]:
+    """Phase-bench-6: copy the container submission template tree from
+    `templates_dir/submission_container/` to `<dst_root>/submission_container/`.
+
+    Lives at the release root (alongside README.md) so submitters
+    discover it without having to traverse `benchmark/release/templates/`.
+    Returns the list of written paths so the manifest covers them.
+    """
+    src = templates_dir / "submission_container"
+    copied: list[pathlib.Path] = []
+    if not src.exists():
+        return copied
+    dst_dir = dst_root / "submission_container"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in _SUBMISSION_CONTAINER_FILES:
+        sp = src / name
+        if not sp.exists():
+            continue
+        dp = dst_dir / name
+        dp.write_bytes(sp.read_bytes())
+        copied.append(dp)
     return copied
 
 
@@ -322,6 +391,11 @@ def build_release(
 
     # 6. Copy code.
     _copy_code_files(src_benchmark, out_dir)
+
+    # 6b. Phase-bench-6: copy the container submission template tree to
+    # <release>/submission_container/ so external submitters can build
+    # their own --network=none container without reverse-engineering it.
+    _copy_submission_container(templates_dir, out_dir)
 
     # 7. Compute counts EARLY so the DATASHEET / TASK / README templates
     # can substitute them in. They're also re-used for the final manifest.

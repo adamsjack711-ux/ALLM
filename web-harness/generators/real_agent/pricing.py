@@ -3,18 +3,42 @@
 Single source of truth so the bot's per-session cost field, the sweep's
 pre-run cost projection, and the dashboard's 24h spend badge all derive
 from the same numbers. Prices below are PUBLIC LIST prices in
-**cents per million tokens** as of 2026-06 — they will drift; treat
-this as an estimate, not a contract.
+**cents per million tokens** as of LAST_REVIEWED — they will drift;
+treat this as an estimate, not a contract.
 
 Lookups against (backend, model) pairs that aren't in the table return
 None (the bot writes `extra.estimated_cost_cents = null` rather than
 guess; the dashboard renders it as 'unpriced'). When you add a new
 model, add it here so the projection isn't silently wrong.
+
+## Drift detection (phase 14d)
+
+The bot calls `warn_if_stale()` at startup. When the table hasn't been
+reviewed in `STALE_DAYS` days, it prints a one-line warning to stderr.
+`python -m generators.real_agent.pricing` (the module's CLI) prints the
+full table — operators run it as an annual review starting point.
+
+When you update prices:
+  1. Verify each row against the provider's current public pricing page.
+  2. Bump `LAST_REVIEWED` to today.
+  3. Bump `PRICING_TABLE_VERSION` minor for price changes, major for a
+     schema change (e.g. adding cached-prompt rates).
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import sys
 from typing import Optional, TypedDict
+
+
+# Schema-vs-content versioning. The version string lives in
+# `extra.pricing_table_version` on every per-session provenance row so
+# downstream consumers (dashboard, sweep cost projection) can join
+# spent-cost against the price list that fed the estimate.
+PRICING_TABLE_VERSION = "1.1"
+LAST_REVIEWED = dt.date(2026, 6, 25)  # phase 14d ships this discipline
+STALE_DAYS = 365
 
 
 class PriceCents(TypedDict):
@@ -95,3 +119,78 @@ def format_cents(cents: Optional[float]) -> str:
     if dollars < 0.01:
         return f"${dollars:.4f}"
     return f"${dollars:.2f}"
+
+
+# ── phase 14d: drift detection ──────────────────────────────────────
+
+
+def staleness_days(now: Optional[dt.date] = None) -> int:
+    """Days since LAST_REVIEWED. Used by `warn_if_stale()` and exposed
+    to the smoke. `now` lets the smoke spoof time without touching
+    `dt.date.today()`."""
+    today = now if now is not None else dt.date.today()
+    return (today - LAST_REVIEWED).days
+
+
+def is_stale(now: Optional[dt.date] = None) -> bool:
+    return staleness_days(now) > STALE_DAYS
+
+
+def warn_if_stale(stream=None, now: Optional[dt.date] = None) -> bool:
+    """One-line stderr warning when the table hasn't been reviewed in
+    STALE_DAYS days. Returns True iff a warning was emitted.
+
+    The bot calls this once at startup. Negative staleness (LAST_REVIEWED
+    in the future) is treated as fresh — clock skew on the host
+    shouldn't trigger spurious warnings."""
+    days = staleness_days(now)
+    if days <= STALE_DAYS:
+        return False
+    out = stream if stream is not None else sys.stderr
+    print(
+        f"[pricing] table v{PRICING_TABLE_VERSION} last reviewed "
+        f"{LAST_REVIEWED.isoformat()} ({days} days ago, > {STALE_DAYS}d "
+        f"threshold). Re-verify against provider pricing pages and "
+        f"bump LAST_REVIEWED.",
+        file=out,
+    )
+    return True
+
+
+def print_table(stream=None) -> None:
+    """Operator entry point: dump every row + the review metadata.
+    `python -m generators.real_agent.pricing` calls this."""
+    out = stream if stream is not None else sys.stdout
+    days = staleness_days()
+    flag = "STALE" if is_stale() else "fresh"
+    print(
+        f"Cernis pricing table v{PRICING_TABLE_VERSION} · "
+        f"last reviewed {LAST_REVIEWED.isoformat()} "
+        f"({days} days ago — {flag})",
+        file=out,
+    )
+    print(file=out)
+    print(f"{'backend':<12} {'model':<26} {'in ¢/M':>10} {'out ¢/M':>10}",
+          file=out)
+    print("-" * 62, file=out)
+    for (backend, model), p in sorted(PRICING.items()):
+        print(
+            f"{backend:<12} {model:<26} "
+            f"{p['input']:>10.2f} {p['output']:>10.2f}",
+            file=out,
+        )
+    print(file=out)
+    print(f"default session envelope: "
+          f"{DEFAULT_TOKENS_PER_SESSION['input']} input / "
+          f"{DEFAULT_TOKENS_PER_SESSION['output']} output tokens",
+          file=out)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI: `python -m generators.real_agent.pricing` prints the table."""
+    print_table()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

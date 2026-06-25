@@ -113,6 +113,12 @@ def llm_spend_summary(
     n_sessions = 0
     unpriced = 0
     by_pair: dict[str, dict] = {}
+    # Phase-bench-7: per-prompt-template-id rollup, keyed by
+    # `<prompt_template_id>/<backend>/<model>`. Joins on the
+    # `extra.prompt_template_id` field that phase 14 already sets
+    # (slug of target_app today; multi-template-per-target work
+    # would populate distinct ids).
+    by_template: dict[str, dict] = {}
     for r in rows:
         ts = float(r.get("ts") or 0)
         if ts < cutoff:
@@ -123,6 +129,10 @@ def llm_spend_summary(
         extra = r.get("extra") or {}
         backend = extra.get("backend") or "?"
         model = extra.get("model") or "?"
+        prompt_template = extra.get("prompt_template_id") or "?"
+        cents = extra.get("estimated_cost_cents")
+        tokens_in = int(extra.get("tokens_in") or 0)
+        tokens_out = int(extra.get("tokens_out") or 0)
         key = f"{backend}/{model}"
         cell = by_pair.setdefault(key, {
             "backend": backend, "model": model,
@@ -130,16 +140,49 @@ def llm_spend_summary(
             "cost_cents": 0.0, "unpriced": False,
         })
         cell["n_sessions"] += 1
-        cell["tokens_in"] += int(extra.get("tokens_in") or 0)
-        cell["tokens_out"] += int(extra.get("tokens_out") or 0)
-        cents = extra.get("estimated_cost_cents")
+        cell["tokens_in"] += tokens_in
+        cell["tokens_out"] += tokens_out
+        # Phase-bench-7: parallel per-template aggregation
+        tkey = f"{prompt_template}/{backend}/{model}"
+        tcell = by_template.setdefault(tkey, {
+            "prompt_template_id": prompt_template,
+            "backend": backend, "model": model,
+            "n_sessions": 0, "tokens_in": 0, "tokens_out": 0,
+            "cost_cents": 0.0, "unpriced": False,
+        })
+        tcell["n_sessions"] += 1
+        tcell["tokens_in"] += tokens_in
+        tcell["tokens_out"] += tokens_out
         if cents is None:
             cell["unpriced"] = True
+            tcell["unpriced"] = True
             unpriced += 1
         else:
             cell["cost_cents"] += float(cents)
+            tcell["cost_cents"] += float(cents)
             total_cents += float(cents)
         n_sessions += 1
+
+    # Phase-bench-7: derived rollup that aggregates across (backend,
+    # model) so the dashboard can show "which template is burning the
+    # most budget?" without the operator having to do the join in
+    # their head.
+    by_template_only: dict[str, dict] = {}
+    for cell in by_template.values():
+        tid = cell["prompt_template_id"]
+        agg = by_template_only.setdefault(tid, {
+            "prompt_template_id": tid,
+            "n_sessions": 0, "tokens_in": 0, "tokens_out": 0,
+            "cost_cents": 0.0, "unpriced": False,
+            "n_backend_model_pairs": 0,
+        })
+        agg["n_sessions"] += cell["n_sessions"]
+        agg["tokens_in"] += cell["tokens_in"]
+        agg["tokens_out"] += cell["tokens_out"]
+        agg["cost_cents"] += cell["cost_cents"]
+        agg["unpriced"] = agg["unpriced"] or cell["unpriced"]
+        agg["n_backend_model_pairs"] += 1
+
     return {
         "window_s": window_s,
         "n_sessions": n_sessions,
@@ -147,6 +190,8 @@ def llm_spend_summary(
         "total_cents": total_cents,
         "total_dollars": total_cents / 100.0,
         "by_backend_model": by_pair,
+        "by_template_backend_model": by_template,
+        "by_template": by_template_only,
     }
 
 

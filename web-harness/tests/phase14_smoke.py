@@ -7,7 +7,8 @@ eval rollups) without spending any LLM budget.
 
 PART A — generator matrix-mode dry-run
   - Build a JSON cells_file covering 3 targets × 2 backends × 1 model
-    each × 2 stealth = 12 cells, varying `sessions` per cell.
+    each × 2 stealth = 16 cells (phase 14c grew it 12→16 by adding
+    WebGoat), varying `sessions` per cell.
   - Run `generators/real_agent/bot.py` as a subprocess with
     CERNIS_AGENT_DRY_RUN=1 and CERNIS_AGENT_CELLS_FILE pointing at the
     file. Verify:
@@ -179,13 +180,14 @@ def part_b_sweep(td: pathlib.Path) -> None:
     print("\n[smoke-p14] PART B — sweep matrix builder + cells_file round-trip")
     from orchestrator import sweep as sweepmod
 
-    # Default config: 3 targets × 2 backends × 1 model each × 2 stealth = 12
-    # (WebGoat + VAmPI deferred — see _LLM_TARGETS in sweep.py)
+    # Default config: 4 targets × 2 backends × 1 model each × 2 stealth = 16
+    # (VAmPI still deferred — JSON-only API. Phase 14c added WebGoat
+    # which grew the matrix 12 → 16.)
     cells = sweepmod.default_llm_config()
-    _assert(len(cells) == 12,
-            f"[B] default matrix size: expected 12, got {len(cells)}")
+    _assert(len(cells) == 16,
+            f"[B] default matrix size: expected 16, got {len(cells)}")
     target_apps = sorted({c.target_app for c in cells})
-    _assert(target_apps == ["crapi", "dvwa", "juice_shop"],
+    _assert(target_apps == ["crapi", "dvwa", "juice_shop", "webgoat"],
             f"[B] default targets wrong: {target_apps}")
     backends = sorted({c.backend for c in cells})
     _assert(backends == ["anthropic", "openai"],

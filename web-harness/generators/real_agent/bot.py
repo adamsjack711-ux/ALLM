@@ -87,6 +87,16 @@ Optional env vars:
                           the smoke; also useful to enumerate what a
                           cells_file would actually run before paying
                           API budget.
+  CERNIS_MAX_BUDGET_CENTS (phase 14c) hard cap on total spend across
+                          all cells/sessions in this container run, in
+                          cents. Unset → no cap (legacy behavior).
+                          Once the running total + a session's
+                          projected cost would exceed the cap, the
+                          remaining work for that cell is skipped and
+                          subsequent cells are not started. Works in
+                          both real + DRY_RUN paths so the smoke can
+                          verify the kill-switch fires without
+                          spending real budget.
 """
 
 from __future__ import annotations
@@ -115,6 +125,60 @@ DRY_RUN_LOG = pathlib.Path(
     os.environ.get("CERNIS_DRY_RUN_LOG",
                    "/tmp/cernis_real_agent_dry_run.jsonl")
 )
+
+
+def _max_budget_cents() -> Optional[float]:
+    """Phase 14c: CERNIS_MAX_BUDGET_CENTS caps total spend across all
+    cells/sessions in this container run. Unset → no enforcement.
+    Negative or unparseable → treated as unset (the bot logs a warning
+    so a typo doesn't silently disable the kill-switch)."""
+    raw = os.environ.get("CERNIS_MAX_BUDGET_CENTS", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        print(
+            f"[real_agent] CERNIS_MAX_BUDGET_CENTS={raw!r} not a number — "
+            f"kill-switch DISABLED for this run", file=sys.stderr,
+        )
+        return None
+    if v < 0:
+        print(
+            f"[real_agent] CERNIS_MAX_BUDGET_CENTS={v} is negative — "
+            f"kill-switch DISABLED for this run", file=sys.stderr,
+        )
+        return None
+    return v
+
+
+MAX_BUDGET_CENTS = _max_budget_cents()
+
+# Cumulative spend tracker. Lives at module level so _run_cell can
+# consult it without ceremony. `cents` is the realized spend so far;
+# `exhausted` flips True once a cell's projected cost would push us
+# over the budget — at that point main() bails on remaining cells.
+_spend_state: dict = {"cents": 0.0, "exhausted": False, "skipped_cells": 0}
+
+
+def _check_budget(projected_cents: Optional[float]) -> bool:
+    """Return True if a cost of `projected_cents` can be incurred
+    without exceeding the budget. None (unpriced) is treated as 0 —
+    the kill-switch lets it through because we can't deduct what we
+    can't measure. Returns True unconditionally when no budget set."""
+    if MAX_BUDGET_CENTS is None:
+        return True
+    projected = projected_cents or 0.0
+    return (_spend_state["cents"] + projected) <= MAX_BUDGET_CENTS
+
+
+def _add_spend(cents: Optional[float]) -> None:
+    """Add realized cost to the running total. Flips `exhausted` when
+    we've crossed the budget."""
+    if cents is not None:
+        _spend_state["cents"] += float(cents)
+    if MAX_BUDGET_CENTS is not None and _spend_state["cents"] >= MAX_BUDGET_CENTS:
+        _spend_state["exhausted"] = True
 
 
 def _dry_run_tokens() -> tuple[int, int]:
@@ -436,7 +500,7 @@ class _TokenCounter:
         self._accumulate(response)
 
 
-async def _run_one_session(cell: AgentCell) -> None:
+async def _run_one_session(cell: AgentCell) -> Optional[float]:
     """One agent session against one cell. Heavy imports happen here so
     the dry-run + sanity paths don't drag the playwright/browser-use
     deps in.
@@ -445,6 +509,9 @@ async def _run_one_session(cell: AgentCell) -> None:
     (the capture proxy only needs class/family/target/stealth on each
     row). The per-session provenance row posted at the end carries the
     actual token counts captured by `_TokenCounter`.
+
+    Returns the realized cost in cents for the kill-switch to deduct
+    from the running budget; None for unpriced (backend, model) pairs.
     """
     base_payload = _payload_for(cell)  # for request headers only
     extra_headers = headers_for(base_payload)
@@ -462,6 +529,7 @@ async def _run_one_session(cell: AgentCell) -> None:
 
     session = BrowserSession(extra_http_headers=extra_headers, headless=True)
     agent = Agent(task=cell.task, llm=llm, browser_session=session)
+    realized_cost: Optional[float] = None
     try:
         await agent.run()
         # Build the provenance payload AFTER the agent finishes so we
@@ -469,6 +537,7 @@ async def _run_one_session(cell: AgentCell) -> None:
         prov_payload = _payload_for(
             cell, tokens_in=counter.tokens_in, tokens_out=counter.tokens_out,
         )
+        realized_cost = prov_payload["extra"].get("estimated_cost_cents")
         try:
             ctx = getattr(session, "context", None)
             ctx_request = getattr(ctx, "request", None) if ctx else None
@@ -486,16 +555,18 @@ async def _run_one_session(cell: AgentCell) -> None:
             await session.close()
         except Exception:
             pass
+    return realized_cost
 
 
 async def _run_cell(cell: AgentCell) -> None:
     projection = pricingmod.estimate_session_projection(cell.backend, cell.model)
+    cell_projection = (projection * cell.sessions) if projection is not None else None
     label = (
         f"target={cell.target_app}({cell.target_url}) "
         f"backend={cell.backend} model={cell.model} "
         f"stealth={cell.stealth} sessions={cell.sessions} "
         f"family={cell.family()} "
-        f"projected_cost={pricingmod.format_cents(projection * cell.sessions if projection is not None else None)}"
+        f"projected_cost={pricingmod.format_cents(cell_projection)}"
     )
     print(f"[real_agent] cell  {label}", flush=True)
 
@@ -505,6 +576,27 @@ async def _run_cell(cell: AgentCell) -> None:
         # call. The legacy dry-run path (no env var) still writes zero tokens.
         tokens_in, tokens_out = _dry_run_tokens()
         payload = _payload_for(cell, tokens_in=tokens_in, tokens_out=tokens_out)
+        per_session_cost = payload["extra"]["estimated_cost_cents"]
+        cell_total_cost = (
+            per_session_cost * cell.sessions if per_session_cost is not None else None
+        )
+
+        # Phase 14c: kill-switch — refuse to write the row if the cell's
+        # projected total would push us past the budget. The smoke
+        # depends on the dry-run log having one entry per logged cell,
+        # so we skip the write entirely rather than write a half-cell.
+        if not _check_budget(cell_total_cost):
+            _spend_state["exhausted"] = True
+            _spend_state["skipped_cells"] += 1
+            print(
+                f"[real_agent]   SKIP cell — would exceed budget "
+                f"(running={_spend_state['cents']:.4f}¢ + "
+                f"cell={pricingmod.format_cents(cell_total_cost)} > "
+                f"max={MAX_BUDGET_CENTS}¢)",
+                flush=True,
+            )
+            return
+
         DRY_RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with DRY_RUN_LOG.open("a") as f:
             f.write(json.dumps({
@@ -512,6 +604,7 @@ async def _run_cell(cell: AgentCell) -> None:
                 "payload": payload,
                 "headers": headers_for(payload),
             }, sort_keys=True) + "\n")
+        _add_spend(cell_total_cost)
         print(
             f"[real_agent]   DRY_RUN: logged payload + headers to "
             f"{DRY_RUN_LOG}, no LLM call made"
@@ -522,12 +615,30 @@ async def _run_cell(cell: AgentCell) -> None:
         return
 
     for i in range(cell.sessions):
+        # Phase 14c: check budget BEFORE starting each session — once
+        # we know a session would push us over, stop the cell. Use the
+        # per-session projection from pricing.py as the cost estimate.
+        if not _check_budget(projection):
+            _spend_state["exhausted"] = True
+            print(
+                f"[real_agent]   skipping session {i + 1}/{cell.sessions}: "
+                f"would exceed budget "
+                f"(running={_spend_state['cents']:.4f}¢ + "
+                f"projected={pricingmod.format_cents(projection)} > "
+                f"max={MAX_BUDGET_CENTS}¢)",
+                flush=True,
+            )
+            return
+
         t0 = time.time()
         try:
-            await _run_one_session(cell)
+            realized_cents = await _run_one_session(cell)
+            _add_spend(realized_cents)
             print(
                 f"[real_agent]   session {i + 1}/{cell.sessions} ok "
-                f"in {time.time() - t0:.1f}s",
+                f"in {time.time() - t0:.1f}s "
+                f"(spent={pricingmod.format_cents(realized_cents)}, "
+                f"total={pricingmod.format_cents(_spend_state['cents'])})",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -542,17 +653,40 @@ async def _run_cell(cell: AgentCell) -> None:
 
 async def main() -> None:
     cells = build_cells()
+    budget_label = (
+        f" max_budget={pricingmod.format_cents(MAX_BUDGET_CENTS)}"
+        if MAX_BUDGET_CENTS is not None else ""
+    )
     print(
         f"[real_agent] phase 14 matrix runner v{GENERATOR_VERSION} "
-        f"n_cells={len(cells)} dry_run={DRY_RUN}",
+        f"n_cells={len(cells)} dry_run={DRY_RUN}{budget_label}",
         flush=True,
     )
     if DRY_RUN and DRY_RUN_LOG.exists():
         # Truncate the log so a fresh dry-run starts clean. The smoke
         # depends on knowing it has only the rows from this invocation.
         DRY_RUN_LOG.unlink()
+
+    n_run = 0
     for cell in cells:
+        if _spend_state["exhausted"]:
+            # Phase 14c: hit the budget — count remaining cells as
+            # skipped without even calling _run_cell. Saves docker
+            # spin-up time on a real run.
+            _spend_state["skipped_cells"] += 1
+            continue
         await _run_cell(cell)
+        n_run += 1
+
+    if MAX_BUDGET_CENTS is not None:
+        print(
+            f"[real_agent] budget summary: spent "
+            f"{pricingmod.format_cents(_spend_state['cents'])} of "
+            f"{pricingmod.format_cents(MAX_BUDGET_CENTS)} · "
+            f"{n_run}/{len(cells)} cells run · "
+            f"{_spend_state['skipped_cells']} skipped by kill-switch",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

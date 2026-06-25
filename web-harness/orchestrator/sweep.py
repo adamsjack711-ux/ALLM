@@ -94,6 +94,18 @@ _TARGETS: dict[str, dict] = {
         "families": {"playwright_bot", "sqlmap", "selenium_bot",
                      "puppeteer_bot", "raw_httpx", "ffuf", "scrapy", "nikto"},
     },
+    # phase 14c: WebGoat lands in the target registry. The Java-app
+    # lesson UI is fully HTML so every browser-driven family applies;
+    # the OWASP Top-10 lessons cover SQLi / XSS / IDOR / etc. so the
+    # non-browser scanners (sqlmap / ffuf / nikto / scrapy / raw_httpx)
+    # also have real surface. capture_webgoat lives under the existing
+    # `multitarget` compose profile, alongside capture_juiceshop +
+    # capture_vampi.
+    "webgoat": {
+        "url": "http://capture_webgoat:8080",
+        "families": {"playwright_bot", "sqlmap", "selenium_bot",
+                     "puppeteer_bot", "raw_httpx", "ffuf", "scrapy", "nikto"},
+    },
     "vampi": {
         "url": "http://capture_vampi:8080",
         "families": {"sqlmap", "raw_httpx", "ffuf"},
@@ -158,11 +170,9 @@ _DEFAULT_LLM_MODELS = {
 # Browser-driven LLM cells against HTML targets present in `_TARGETS`.
 # VAmPI is JSON-only — excluded because a browser-use agent there adds
 # no detection signal beyond what sqlmap / raw_httpx already produce.
-# WebGoat isn't in `_TARGETS` either (it was scoped in phase 7 prose
-# but never landed as a sweep target). Both are phase-14 follow-up
-# items: an HTTP-only LLM client for VAmPI + adding WebGoat to the
-# target registry.
-_LLM_TARGETS = ("dvwa", "juice_shop", "crapi")
+# Phase 14c adds WebGoat to this list now that it's registered in
+# `_TARGETS`; the default matrix grew 12→16 cells.
+_LLM_TARGETS = ("dvwa", "juice_shop", "webgoat", "crapi")
 
 
 @dataclasses.dataclass(frozen=True)

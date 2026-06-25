@@ -23,7 +23,7 @@ PART B — bot.py dry-run with spoofed tokens
     tokens_in=0, tokens_out=0 with non-None cost (zero) for priced pairs
 
 PART C — orchestrator/sweep.py cost_projection_for_cells
-  - 12-cell default matrix → non-zero total_cents + per-cell breakdown
+  - default matrix → non-zero total_cents + per-cell breakdown
   - unpriced model surfaces in `unpriced_cells`
   - format_cents result lands in `total_formatted`
 
@@ -220,7 +220,7 @@ def part_c_sweep_projection() -> None:
     cost2 = sweepmod.cost_projection_for_cells(custom)
     _assert("openai/nonexistent-fake-model" in cost2["unpriced_cells"],
             f"[C] unpriced detection failed: {cost2['unpriced_cells']}")
-    print(f"[smoke-p14b]   default 12-cell projection: "
+    print(f"[smoke-p14b]   default {len(cells)}-cell projection: "
           f"{cost['total_formatted']}")
     print("[smoke-p14b] PART C passed")
 

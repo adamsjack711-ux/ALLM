@@ -27,8 +27,10 @@ pipeline/
 ├── score_heldout_emulation.py # held-out emulation-family eval (phase 2)
 ├── alert_fatigue.py          # window-rate FP/hour arithmetic (phase 3)
 │                             #   + --multi-day + --deployments-file (phase 4)
+│                             #   + --per-eid-attribution (phase 5)
 ├── calibrate_eventrate.py    # real-Sysmon → deployments.json (phase 4)
-├── COLLECTOR_TUNING.md       # operator cookbook (phase 4)
+├── per_eid_attribution.py    # dropout + composition view    (phase 5)
+├── COLLECTOR_TUNING.md       # operator cookbook (phase 4 + 5)
 ├── synth_caldera.py          # synthetic CALDERA campaign
 ├── synth_atomic.py           # synthetic Atomic campaign        (phase 2)
 ├── synth_workload.py         # synthetic normal-workload campaign (phase 2)
@@ -37,11 +39,13 @@ pipeline/
 ├── smoke_phase2.py           # phase 2 smoke
 ├── smoke_phase3.py           # phase 3 smoke
 ├── smoke_phase4.py           # phase 4 smoke
+├── smoke_phase_host_5.py     # phase 5 smoke
 └── README.md                 # this file
 data/host/
 ├── manifest.jsonl            # append-only provenance, one row per campaign
-├── alert_fatigue.json        # window-rate arithmetic output (phase 3+4)
+├── alert_fatigue.json        # window-rate arithmetic output (phase 3+4+5)
 ├── deployments.json          # calibrated deployment shapes  (phase 4)
+├── per_eid_attribution.json  # per-EID dropout + composition (phase 5)
 └── <campaign_id>/
     ├── sysmon.jsonl          # range collector dump (you drop this)
     ├── caldera_op.json       # CALDERA op report (you drop this)
@@ -597,12 +601,85 @@ p95 / max stats).
 
 - **Automatic Sysmon config edits.** Exclusion-stanza XML is supplied;
   deploying it through GPO / config management is still manual.
-- **Per-EID FP attribution at window granularity.** The cookbook
-  gives an approximation from per-EID share × per-window FP rate.
-  Exact attribution requires windowized inference over per-EID-only
-  campaigns — phase-host-5 scope.
+- ~~Per-EID FP attribution at window granularity.~~ **Phase 5 ships
+  this** — see the section below.
 - **On-host agent threshold deployment.** The arithmetic is offline;
   pushing the picked τ to a running detector is out of scope here.
+
+## Phase 5 — per-EID FP attribution at window granularity
+
+Phase 3 + 4 give you total normal-workload FP/hour at a fitted
+threshold τ and let you calibrate deployment shapes from real Sysmon.
+`COLLECTOR_TUNING.md §4` told you which EIDs to filter using an
+approximation: `fp_per_hour_X ≈ share_X × p_w × W_total`. Phase 5
+replaces that with two real measurements.
+
+### `pipeline/per_eid_attribution.py`
+
+Two complementary views against a held-back normal-workload campaign:
+
+1. **Dropout attribution** (marginal effect): for each EID X in the
+   campaign, filter its events out, re-windowize + re-score with the
+   same trained classifier at the same τ, measure the delta in
+   per-window FP rate. `contribution_X = FP_rate(all) − FP_rate(all \ {X})`.
+   Positive = EID adds FPs; negative = filtering it would actually
+   make detection worse (the detector uses it for context).
+
+2. **Per-window EID composition** (descriptive): for every scored
+   window, record the dominant EID + share. Bucket windows by
+   dominant EID; compute FP rate per bucket. Surfaces "windows
+   where EID 10 is the majority fire at X% FP rate" as a concrete
+   signal independent of dropout.
+
+The two views are complementary: dropout ranks EIDs by marginal
+effect; composition validates the rank by showing whether the
+high-dropout EIDs also have high-FP buckets.
+
+```sh
+python3 -m pipeline.per_eid_attribution \
+    --campaign workload-001 \
+    --fp-budget 1.0 \
+    --out data/host/per_eid_attribution.json
+```
+
+### `alert_fatigue --per-eid-attribution`
+
+When `data/host/per_eid_attribution.json` exists,
+`pipeline.alert_fatigue` auto-discovers it and attaches a
+`per_eid_contributions` block to each `deployment_estimate`. Per-EID
+FP/hour at deployment D is the real-measurement value:
+
+    fp_per_hour_X = contribution_X × windows_per_hour_continuous(D)
+
+The output ranks EIDs by `|fp_per_hour|` so the noisiest land first.
+`alert_fatigue.json` carries `per_eid_attribution_source` so the
+operator knows which attribution file fed the numbers.
+
+### Smoke
+
+```sh
+python3 -m pipeline.smoke_phase_host_5    # no docker, no real Sysmon
+```
+
+Stages the phase-host-2 synth set, runs per_eid_attribution against
+the workload campaign, verifies the dropout view has one row per
+distinct EID + the composition view buckets by dominant EID, runs
+alert_fatigue with the auto-discovered attribution and confirms the
+new `per_eid_contributions` block lands on each deployment estimate.
+NEVER reports accuracy.
+
+### What phase 5 explicitly does *not* do
+
+- **Per-EID attribution on attack campaigns** (which EIDs are
+  load-bearing for *detection*). Symmetric problem; could pair with
+  this in a follow-up.
+- **Per-EID × per-deployment cost-benefit analysis** (e.g.,
+  "filtering EID 10 cuts FP/hour by 0.4 but loses 12% recall on
+  Atomic"). Needs combined attack + benign attribution; phase-host-6
+  territory.
+- **Sysmon config XML auto-generation** from the dropout ranking.
+  The cookbook tells you which EIDs to filter; deploying via GPO
+  is still manual.
 
 ## What phase 1 explicitly does *not* do (historical)
 

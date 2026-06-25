@@ -348,6 +348,50 @@ def _fp_per_hour_estimate(
     return out
 
 
+def _attach_per_eid_contributions(
+    deployment_estimates: list[dict],
+    attribution_path: Optional[pathlib.Path],
+) -> Optional[str]:
+    """Phase-host-5: when `per_eid_attribution.json` exists, append a
+    `per_eid_contributions` block to each deployment estimate so the
+    operator sees per-EID FP/hour at the deployment shape they care
+    about. Quiet no-op when the path is None or missing — the
+    attribution is optional.
+
+    Per-deployment per-EID FP/hour is:
+        fp_per_hour_X = contribution_X × windows_per_hour_continuous(D)
+    where `contribution_X` is the measured FP-rate delta from the
+    dropout step (positive: EID adds FPs; negative: filtering it would
+    *increase* FPs, rare but real).
+
+    Returns the attribution-source path (or None when no-op) so the
+    caller can record it in the report.
+    """
+    if attribution_path is None or not attribution_path.exists():
+        return None
+    try:
+        attribution = json.loads(attribution_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    per_eid = (attribution.get("dropout_attribution") or {}).get("per_eid") or []
+    for est in deployment_estimates:
+        w_total = est.get("windows_per_hour_continuous", 0.0)
+        contribs: list[dict] = []
+        for entry in per_eid:
+            contrib = entry.get("contribution_to_fp_rate")
+            if contrib is None:
+                continue
+            contribs.append({
+                "eid": entry["eid"],
+                "share_events": entry.get("share_events"),
+                "contribution_to_fp_rate": contrib,
+                "fp_per_hour": float(contrib) * w_total,
+            })
+        contribs.sort(key=lambda c: abs(c["fp_per_hour"]), reverse=True)
+        est["per_eid_contributions"] = contribs
+    return str(attribution_path)
+
+
 # ----------------------------------------------------------------------
 # Multi-day partitioning
 # ----------------------------------------------------------------------
@@ -458,6 +502,7 @@ def run(
     burst_shapes: dict,
     train_frac: float = 0.75,
     multi_day: bool = False,
+    per_eid_attribution_path: Optional[pathlib.Path] = None,
 ) -> dict:
     manifest = provenance_host.load(data_root / "manifest.jsonl")
     if not manifest:
@@ -554,6 +599,13 @@ def run(
         per_class_fp, per_subtype_fp, deployments, burst_shapes,
     )
 
+    # Phase-host-5: attach measured per-EID FP/hour contributions when
+    # the operator has run `pipeline.per_eid_attribution` against a
+    # normal-workload campaign. No-op when the file doesn't exist.
+    attribution_source = _attach_per_eid_contributions(
+        deployment_estimates, per_eid_attribution_path,
+    )
+
     report = {
         "fp_per_hour_budget": fp_per_hour_budget,
         "threshold": tau,
@@ -566,6 +618,7 @@ def run(
         "mttd_by_attack_family": mttd,
         "deployment_estimates": deployment_estimates,
         "burst_shapes_used": burst_shapes,
+        "per_eid_attribution_source": attribution_source,
     }
 
     if multi_day:
@@ -599,6 +652,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="partition eval campaigns by UTC ts_start day and emit "
                          "per-day per-class FP rate + per-deployment FP/hour "
                          "distribution (median/p95/min/max) at the fixed τ.")
+    ap.add_argument("--per-eid-attribution", type=pathlib.Path, default=None,
+                    help="phase-host-5: attach measured per-EID FP/hour "
+                         "contributions to each deployment estimate. Pass the "
+                         "path produced by `pipeline.per_eid_attribution` "
+                         "(typically data/host/per_eid_attribution.json). "
+                         "When omitted, defaults to that path if it exists; "
+                         "otherwise the block is quietly skipped.")
     ap.add_argument("--out", type=pathlib.Path,
                     default=pathlib.Path("data/host/alert_fatigue.json"))
     args = ap.parse_args(argv)
@@ -614,10 +674,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         deployments = DEFAULT_DEPLOYMENTS
 
+    attribution_path = args.per_eid_attribution
+    if attribution_path is None:
+        default_attribution = args.data_root / "per_eid_attribution.json"
+        if default_attribution.exists():
+            attribution_path = default_attribution
+
     report = run(
         args.data_root, args.fp_budget, args.seed,
         deployments=deployments, burst_shapes=DEFAULT_BURST_SHAPES,
         multi_day=args.multi_day,
+        per_eid_attribution_path=attribution_path,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))
@@ -650,6 +717,18 @@ def main(argv: list[str] | None = None) -> int:
               f"total={est['total_fp_per_hour']:.2f}/h  "
               f"(normal={est['normal_fp_per_hour']:.2f} + "
               f"hard_neg={est['hard_negative_fp_per_hour']:.2f})")
+
+    if report.get("per_eid_attribution_source"):
+        print()
+        print(f"  per-EID FP/hour contributions (from "
+              f"{report['per_eid_attribution_source']}):")
+        first = report["deployment_estimates"][0]
+        contribs = first.get("per_eid_contributions") or []
+        for c in contribs[:6]:
+            sign = "+" if c["fp_per_hour"] >= 0 else ""
+            print(f"    EID {c['eid']:>4}  share={(c.get('share_events') or 0)*100:5.1f}%  "
+                  f"contribution_to_fp_rate={c['contribution_to_fp_rate']:+.4f}  "
+                  f"@ {first['deployment']}: {sign}{c['fp_per_hour']:.2f}/h")
 
     if "daily" in report:
         days = report["daily"]["days"]

@@ -112,22 +112,87 @@ After applying exclusions, re-run `calibrate_eventrate` and compare:
 
 ## 4. Per-EID FP attribution
 
-`alert_fatigue.json` doesn't break FP down by EID directly, but the
-combination of `calibrate_eventrate`'s `per_eid.share` and
-`alert_fatigue`'s `per_class_fp_rate.normal.fp_rate` gives a rough
-attribution. The arithmetic:
+**Phase-host-5 replaces the approximation this section used to ship
+with two real measurements.** The old `fp_per_hour_X ≈ share_X × p_w × W_total`
+formula is left here for context — if you've staged a normal-workload
+campaign you can now compute the actual contributions.
 
-> If EID X accounts for `share_X` of all events, and the normal-workload
-> per-window FP rate is `p_w`, then EID X's contribution to FP/hour at
-> deployment D is approximately:
->
->     fp_per_hour_X ≈ share_X × p_w × (D.hosts × D.rate × 3600 / WINDOW_STRIDE)
+### The measurement
 
-This isn't exact — windows mix EIDs — but it's tight enough to rank
-EIDs by impact and pick which filter to invest in first. The full per-
-window-per-EID attribution would need windowized inference on a held-
-back normal-workload campaign, which is a phase-host-5 item, not this
-phase.
+`pipeline/per_eid_attribution.py` computes two complementary views
+against a held-back normal-workload campaign:
+
+1. **Dropout attribution** (marginal effect): for each EID X, filter
+   its events out of the campaign, re-windowize + re-score with the
+   same trained classifier at the same τ, then:
+
+       contribution_X = FP_rate(all) − FP_rate(all \ {X})
+
+   A positive contribution means EID X is responsible for that many
+   percentage points of the realized FP rate. Negative is possible
+   (rare — filtering some EIDs can reduce context the detector relies
+   on); we keep the real number rather than clamp.
+
+2. **Per-window EID composition** (descriptive): for every scored
+   window, record the dominant EID + share. Bucket windows by
+   dominant EID and report FP rate per bucket. Surfaces "windows
+   where EID 10 is the majority fire at 8.4% FP rate" as a concrete
+   signal independent of the dropout view.
+
+### Workflow
+
+```sh
+# Stage a normal-workload campaign (real or synth)
+python3 -m pipeline.synth_workload --campaign workload-001
+python3 -m pipeline.score_campaign --campaign workload-001 --synth-mix 4
+
+# Compute per-EID attribution against it
+python3 -m pipeline.per_eid_attribution \
+    --campaign workload-001 \
+    --fp-budget 1.0 \
+    --out data/host/per_eid_attribution.json
+
+# Alert-fatigue now surfaces per-deployment per-EID FP/hour
+python3 -m pipeline.alert_fatigue --fp-budget 1.0
+```
+
+`alert_fatigue` auto-discovers `data/host/per_eid_attribution.json` and
+attaches a `per_eid_contributions` block to each deployment estimate.
+Per-deployment per-EID FP/hour is:
+
+    fp_per_hour_X = contribution_X × windows_per_hour_continuous(D)
+
+### Worked example output
+
+```
+EID    1  share=42.3%  contribution_to_fp_rate=+0.0210  @ med_business: +18.92/h
+EID   10  share= 4.7%  contribution_to_fp_rate=+0.0095  @ med_business:  +8.55/h
+EID   13  share=15.1%  contribution_to_fp_rate=+0.0040  @ med_business:  +3.60/h
+EID    3  share=23.0%  contribution_to_fp_rate=-0.0012  @ med_business:  -1.08/h
+```
+
+Reading: EID 1 and EID 10 are doing real work for the detector — filter
+them at your own risk. EID 13 is a clear win if you exclude noisy
+registry paths. EID 3 actually *helps* in this configuration — the
+slight negative contribution means filtering it out makes detection
+worse, not better.
+
+### Ranking + sanity checks
+
+- High-share + high-positive-contribution → clear filter targets
+  (e.g. EID 13 RegistryEvent with broad scope).
+- High-share + ~zero contribution → load on the collector but
+  unimportant for detection; filter aggressively.
+- Low-share + high-positive-contribution → narrow EIDs the detector
+  leans on disproportionately; treat carefully.
+- Negative contribution → DO NOT filter; the detector is using it
+  for context.
+
+Cross-validate the dropout ranking against the per-window composition
+view: high-contribution EIDs should also have high FP rate in their
+dominant-EID bucket. If they don't, the dropout is picking up
+indirect effects (filtering EID X changes window boundaries which
+changes other features); the composition view is the cleaner read.
 
 ## 5. Burst shape encoding
 

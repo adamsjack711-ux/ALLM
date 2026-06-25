@@ -29,7 +29,8 @@ pipeline/
 │                             #   + --multi-day + --deployments-file (phase 4)
 │                             #   + --per-eid-attribution (phase 5)
 ├── calibrate_eventrate.py    # real-Sysmon → deployments.json (phase 4)
-├── per_eid_attribution.py    # dropout + composition view    (phase 5)
+├── per_eid_attribution.py    # benign dropout + composition + attack
+│                             #   dropout (--target-class) (phase 5 + 6)
 ├── COLLECTOR_TUNING.md       # operator cookbook (phase 4 + 5)
 ├── synth_caldera.py          # synthetic CALDERA campaign
 ├── synth_atomic.py           # synthetic Atomic campaign        (phase 2)
@@ -40,12 +41,14 @@ pipeline/
 ├── smoke_phase3.py           # phase 3 smoke
 ├── smoke_phase4.py           # phase 4 smoke
 ├── smoke_phase_host_5.py     # phase 5 smoke
+├── smoke_phase_host_6.py     # phase 6 smoke
 └── README.md                 # this file
 data/host/
 ├── manifest.jsonl            # append-only provenance, one row per campaign
 ├── alert_fatigue.json        # window-rate arithmetic output (phase 3+4+5)
 ├── deployments.json          # calibrated deployment shapes  (phase 4)
-├── per_eid_attribution.json  # per-EID dropout + composition (phase 5)
+├── per_eid_attribution.json  # benign per-EID dropout + composition  (phase 5)
+├── per_eid_attack_attribution.json  # attack per-EID dropout         (phase 6)
 └── <campaign_id>/
     ├── sysmon.jsonl          # range collector dump (you drop this)
     ├── caldera_op.json       # CALDERA op report (you drop this)
@@ -670,16 +673,84 @@ NEVER reports accuracy.
 
 ### What phase 5 explicitly does *not* do
 
-- **Per-EID attribution on attack campaigns** (which EIDs are
-  load-bearing for *detection*). Symmetric problem; could pair with
-  this in a follow-up.
-- **Per-EID × per-deployment cost-benefit analysis** (e.g.,
-  "filtering EID 10 cuts FP/hour by 0.4 but loses 12% recall on
-  Atomic"). Needs combined attack + benign attribution; phase-host-6
-  territory.
+- ~~Per-EID attribution on attack campaigns.~~ **Phase 6 ships this** —
+  see the section below.
+- ~~Per-EID × per-deployment cost-benefit analysis.~~ **Phase 6 ships
+  this** — see the section below.
 - **Sysmon config XML auto-generation** from the dropout ranking.
   The cookbook tells you which EIDs to filter; deploying via GPO
   is still manual.
+
+## Phase 6 — attack-side per-EID attribution + cost-benefit
+
+Phase 5 measures filtering *cost saved* (FP/hour reduction on benign
+workload). Phase 6 measures filtering *cost paid* (recall lost on
+attack campaigns) and combines the two views into a rank-by-trade-off
+operator output.
+
+### `pipeline/per_eid_attribution.py --target-class attack`
+
+Same dropout pattern as phase 5, but against an attack campaign and
+measuring the WINDOW-LEVEL DETECTION RATE delta at the trained τ:
+
+```
+contribution_to_detect_rate_X = detect_rate(all) - detect_rate(all \ {X})
+```
+
+Positive = EID X is load-bearing for detection; filtering loses
+recall. Negative = filtering helps. The attack-side run uses the same
+HistGradientBoostingClassifier + τ as alert_fatigue, so the numbers
+trade off cleanly with the phase-5 benign attribution.
+
+```sh
+python3 -m pipeline.per_eid_attribution \
+    --campaign synth-caldera-001 \
+    --target-class attack \
+    --out data/host/per_eid_attack_attribution.json
+```
+
+### `alert_fatigue --per-eid-attack-attribution`
+
+When BOTH `data/host/per_eid_attribution.json` (benign) AND
+`data/host/per_eid_attack_attribution.json` (attack) exist,
+`alert_fatigue` auto-discovers them and attaches a
+`per_eid_cost_benefit` block to each deployment estimate:
+
+```
+EID    fp_per_hour_saved   recall_lost   ranking_score
+  1     +18.92 / h         +0.080        +10.92
+ 13     +3.60  / h          0.000        +3.60
+ 10     +8.55  / h         +0.120        -3.45
+```
+
+Default ranking score: `fp_per_hour_saved − recall_weight × recall_lost`
+with `recall_weight=100` (a 1pp recall drop = 1 FP/hour saved). Tune
+with `--recall-weight N` for your operational reality. Highest score =
+best filter candidate.
+
+Report carries `per_eid_cost_benefit_meta` with both source paths +
+the recall weight used so the operator can reproduce.
+
+### Smoke
+
+```sh
+python3 -m pipeline.smoke_phase_host_6
+```
+
+Stages the phase-host-2 synth set, runs per_eid_attribution in BOTH
+modes, runs alert_fatigue with and without the attack attribution
+file, asserts the cost-benefit shape + recall_weight tuning behavior.
+
+### What phase 6 explicitly does *not* do
+
+- **Sysmon config XML auto-generation** from the cost-benefit ranking.
+  The output tells you which EIDs to filter; deploying via GPO is
+  still manual.
+- **Per-EID-share-aware threshold tuning** (composite τ optimization
+  across EIDs). Out of scope; see backlog.
+- **Multi-attack-family attribution**. Today the attack-side dropout
+  runs against ONE campaign at a time. Aggregating across CALDERA +
+  Atomic + a custom emulation family at once is a phase-host-7 item.
 
 ## What phase 1 explicitly does *not* do (historical)
 

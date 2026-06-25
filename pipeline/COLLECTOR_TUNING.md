@@ -194,6 +194,45 @@ dominant-EID bucket. If they don't, the dropout is picking up
 indirect effects (filtering EID X changes window boundaries which
 changes other features); the composition view is the cleaner read.
 
+### Cost-benefit (phase-host-6)
+
+§4 above measures filtering *cost saved* (FP/hour reduction). It does
+not tell you what filtering *costs detection*. Phase-host-6 adds the
+symmetric measurement on attack campaigns:
+
+```sh
+python3 -m pipeline.per_eid_attribution \
+    --campaign synth-caldera-001 \
+    --target-class attack \
+    --out data/host/per_eid_attack_attribution.json
+```
+
+For each EID, the attack-side dropout measures
+`contribution_to_detect_rate_X = detect_rate(all) - detect_rate(all \ {X})`
+on attack-labeled windows. Positive = EID X is load-bearing for
+detection; filtering loses recall. Negative = filtering would actually
+help. When BOTH attribution files exist, `alert_fatigue` auto-discovers
+them and surfaces a `per_eid_cost_benefit` block per deployment with:
+
+```
+EID    fp_per_hour_saved    recall_lost    ranking_score
+  1     +18.92 / h          +0.080         +10.92
+ 13     +3.60  / h           0.000         +3.60
+ 10     +8.55  / h          +0.120         -3.45
+  3     -1.08  / h          -0.020          +0.92
+```
+
+The default `ranking_score = fp_per_hour_saved − 100 × recall_lost`
+weighs a 1-percentage-point recall drop equally to 1 FP/hour saved.
+Tune with `--recall-weight N` for your operational reality: SOC drowning
+in alerts → `--recall-weight 10`; high-fidelity detector that already
+has manageable FP rate → `--recall-weight 1000`. Highest score = best
+filter candidate.
+
+The two views compose:
+- High dropout cost (FP/hour saved big) + low recall cost = safe filter.
+- High recall cost = DO NOT FILTER even if FP saved is also high.
+
 ## 5. Burst shape encoding
 
 `alert_fatigue.DEFAULT_BURST_SHAPES` ships five subtypes (`ps_remoting`,

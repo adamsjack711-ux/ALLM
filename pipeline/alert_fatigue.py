@@ -392,6 +392,92 @@ def _attach_per_eid_contributions(
     return str(attribution_path)
 
 
+def _attach_per_eid_cost_benefit(
+    deployment_estimates: list[dict],
+    benign_attribution_path: Optional[pathlib.Path],
+    attack_attribution_path: Optional[pathlib.Path],
+    *,
+    recall_weight: float = 100.0,
+) -> Optional[dict]:
+    """Phase-host-6: cost-benefit rollup. When BOTH the benign-side
+    per_eid_attribution.json AND the attack-side
+    per_eid_attack_attribution.json exist, surface for each EID
+    present in both:
+
+        fp_per_hour_saved_X = benign.contribution × windows_per_hour(D)
+        recall_lost_X      = attack.contribution_to_detect_rate
+        ranking_score      = fp_per_hour_saved_X − recall_weight × recall_lost_X
+
+    Sorted by ranking_score desc on each deployment_estimate. Operator
+    reads "highest ranking_score = best filter candidate"; can recompute
+    with their own `recall_weight` to trade off (default 100 weights
+    a 1-percentage-point recall drop equally to 1 saved FP/hour).
+
+    Returns a dict with the two source paths + the recall_weight used,
+    or None when either side is missing. The deployment_estimate's
+    `per_eid_cost_benefit` block is attached in-place.
+    """
+    if (benign_attribution_path is None or not benign_attribution_path.exists()
+            or attack_attribution_path is None
+            or not attack_attribution_path.exists()):
+        return None
+    try:
+        benign = json.loads(benign_attribution_path.read_text())
+        attack = json.loads(attack_attribution_path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+    benign_by_eid: dict[int, dict] = {}
+    for row in (benign.get("dropout_attribution") or {}).get("per_eid") or []:
+        if row.get("contribution_to_fp_rate") is not None:
+            benign_by_eid[int(row["eid"])] = row
+
+    attack_rows = (
+        attack.get("attack_dropout_attribution") or {}
+    ).get("per_eid") or []
+    attack_by_eid: dict[int, dict] = {}
+    for row in attack_rows:
+        if row.get("contribution_to_detect_rate") is not None:
+            attack_by_eid[int(row["eid"])] = row
+
+    common_eids = sorted(set(benign_by_eid) & set(attack_by_eid))
+    if not common_eids:
+        return {
+            "benign_attribution_source": str(benign_attribution_path),
+            "attack_attribution_source": str(attack_attribution_path),
+            "recall_weight": recall_weight,
+            "n_eids_with_cost_benefit": 0,
+            "note": "no EIDs appear in both benign + attack attribution",
+        }
+
+    for est in deployment_estimates:
+        w_total = est.get("windows_per_hour_continuous", 0.0)
+        cb_rows: list[dict] = []
+        for eid in common_eids:
+            b = benign_by_eid[eid]
+            a = attack_by_eid[eid]
+            fp_saved = float(b["contribution_to_fp_rate"]) * w_total
+            recall_lost = float(a["contribution_to_detect_rate"])
+            ranking = fp_saved - recall_weight * recall_lost
+            cb_rows.append({
+                "eid": eid,
+                "share_events_benign": b.get("share_events"),
+                "share_events_attack": a.get("share_events"),
+                "fp_per_hour_saved": fp_saved,
+                "recall_lost": recall_lost,
+                "ranking_score": ranking,
+            })
+        cb_rows.sort(key=lambda r: r["ranking_score"], reverse=True)
+        est["per_eid_cost_benefit"] = cb_rows
+
+    return {
+        "benign_attribution_source": str(benign_attribution_path),
+        "attack_attribution_source": str(attack_attribution_path),
+        "recall_weight": recall_weight,
+        "n_eids_with_cost_benefit": len(common_eids),
+    }
+
+
 # ----------------------------------------------------------------------
 # Multi-day partitioning
 # ----------------------------------------------------------------------
@@ -503,6 +589,8 @@ def run(
     train_frac: float = 0.75,
     multi_day: bool = False,
     per_eid_attribution_path: Optional[pathlib.Path] = None,
+    per_eid_attack_attribution_path: Optional[pathlib.Path] = None,
+    recall_weight: float = 100.0,
 ) -> dict:
     manifest = provenance_host.load(data_root / "manifest.jsonl")
     if not manifest:
@@ -606,6 +694,15 @@ def run(
         deployment_estimates, per_eid_attribution_path,
     )
 
+    # Phase-host-6: cost-benefit rollup when BOTH the benign and attack
+    # attribution files exist. No-op when either is missing.
+    cost_benefit_meta = _attach_per_eid_cost_benefit(
+        deployment_estimates,
+        per_eid_attribution_path,
+        per_eid_attack_attribution_path,
+        recall_weight=recall_weight,
+    )
+
     report = {
         "fp_per_hour_budget": fp_per_hour_budget,
         "threshold": tau,
@@ -619,6 +716,7 @@ def run(
         "deployment_estimates": deployment_estimates,
         "burst_shapes_used": burst_shapes,
         "per_eid_attribution_source": attribution_source,
+        "per_eid_cost_benefit_meta": cost_benefit_meta,
     }
 
     if multi_day:
@@ -659,6 +757,16 @@ def main(argv: list[str] | None = None) -> int:
                          "(typically data/host/per_eid_attribution.json). "
                          "When omitted, defaults to that path if it exists; "
                          "otherwise the block is quietly skipped.")
+    ap.add_argument("--per-eid-attack-attribution", type=pathlib.Path,
+                    default=None,
+                    help="phase-host-6: pair with --per-eid-attribution to "
+                         "compute the cost-benefit rollup. Defaults to "
+                         "data/host/per_eid_attack_attribution.json when "
+                         "that file exists; otherwise skipped.")
+    ap.add_argument("--recall-weight", type=float, default=100.0,
+                    help="phase-host-6 ranking weight: ranking_score = "
+                         "fp_per_hour_saved − recall_weight × recall_lost. "
+                         "Default 100 weights 1pp recall drop = 1 FP/hour saved.")
     ap.add_argument("--out", type=pathlib.Path,
                     default=pathlib.Path("data/host/alert_fatigue.json"))
     args = ap.parse_args(argv)
@@ -680,11 +788,19 @@ def main(argv: list[str] | None = None) -> int:
         if default_attribution.exists():
             attribution_path = default_attribution
 
+    attack_attribution_path = args.per_eid_attack_attribution
+    if attack_attribution_path is None:
+        default_attack = args.data_root / "per_eid_attack_attribution.json"
+        if default_attack.exists():
+            attack_attribution_path = default_attack
+
     report = run(
         args.data_root, args.fp_budget, args.seed,
         deployments=deployments, burst_shapes=DEFAULT_BURST_SHAPES,
         multi_day=args.multi_day,
         per_eid_attribution_path=attribution_path,
+        per_eid_attack_attribution_path=attack_attribution_path,
+        recall_weight=args.recall_weight,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))
@@ -729,6 +845,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    EID {c['eid']:>4}  share={(c.get('share_events') or 0)*100:5.1f}%  "
                   f"contribution_to_fp_rate={c['contribution_to_fp_rate']:+.4f}  "
                   f"@ {first['deployment']}: {sign}{c['fp_per_hour']:.2f}/h")
+
+    cb_meta = report.get("per_eid_cost_benefit_meta")
+    if cb_meta and cb_meta.get("n_eids_with_cost_benefit"):
+        print()
+        print(f"  per-EID cost-benefit (recall_weight={cb_meta['recall_weight']}, "
+              f"top filter candidates by ranking_score):")
+        first = report["deployment_estimates"][0]
+        cb_rows = first.get("per_eid_cost_benefit") or []
+        for c in cb_rows[:6]:
+            print(f"    EID {c['eid']:>4}  fp_saved={c['fp_per_hour_saved']:+.2f}/h  "
+                  f"recall_lost={c['recall_lost']:+.4f}  "
+                  f"score={c['ranking_score']:+.2f}")
 
     if "daily" in report:
         days = report["daily"]["days"]

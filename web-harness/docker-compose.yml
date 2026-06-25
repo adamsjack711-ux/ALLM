@@ -653,6 +653,43 @@ services:
     networks: [cernis_lab]
     profiles: ["real-agent"]
 
+  # ── phase 14-vampi: HTTP-only LLM client for VAmPI ─────────────────
+  # JSON-only API has no DOM, so the browser-use real_agent adds no
+  # detection signal beyond sqlmap / raw_httpx. This service runs a
+  # langchain-httpx tool-call loop instead: the LLM emits ACTION:
+  # <METHOD> <path> [body] lines, the bot executes via httpx, feeds
+  # response back. Family naming reuses `llm_<backend>_<model_slug>`
+  # so the existing per_llm_* eval rollups pick it up automatically;
+  # `extra.framework="langchain-httpx"` separates HTTP from browser
+  # sessions at consumer time.
+  #
+  # Bring up with:
+  #     docker compose --profile real-agent-http up --build real_agent_http
+  # CERNIS_AGENT_CELLS_FILE is required (no single-cell fallback —
+  # matrix-only by design).
+
+  real_agent_http:
+    build:
+      context: ./generators
+      dockerfile: real_agent_http/Dockerfile
+    container_name: cernis_real_agent_http
+    env_file:
+      - .env
+    environment:
+      CERNIS_AGENT_CELLS_FILE: ${CERNIS_AGENT_CELLS_FILE_HTTP:-/data/llm_http_cells.json}
+      CERNIS_AGENT_DRY_RUN: ${CERNIS_AGENT_DRY_RUN:-}
+      CERNIS_MAX_BUDGET_CENTS: ${CERNIS_MAX_BUDGET_CENTS:-}
+      CERNIS_PERSISTED_SPEND_FILE: ${CERNIS_PERSISTED_SPEND_FILE_HTTP:-}
+      CERNIS_MAX_STEPS: ${CERNIS_MAX_STEPS:-12}
+      CERNIS_HTTP_TIMEOUT_S: ${CERNIS_HTTP_TIMEOUT_S:-10}
+    volumes:
+      - ./data:/data:ro
+      - ./data/llm_spend:/var/lib/cernis/spend:rw
+    depends_on:
+      - capture_vampi
+    networks: [cernis_lab]
+    profiles: ["real-agent-http"]
+
   # ── phase 15: live operator dashboard ──────────────────────────────
   # Tails sessions.jsonl + requests.jsonl + leaderboard.jsonl +
   # alert_fatigue.json and renders three panels. Read-only — never

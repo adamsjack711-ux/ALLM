@@ -643,11 +643,22 @@ services:
       CERNIS_AGENT_CELLS_FILE: ${CERNIS_AGENT_CELLS_FILE:-}
       CERNIS_AGENT_DRY_RUN: ${CERNIS_AGENT_DRY_RUN:-}
       CERNIS_AGENT_TASKS_FILE: ${CERNIS_AGENT_TASKS_FILE:-}
+      # Phase 14c kill-switch (caps total spend in this container run)
+      CERNIS_MAX_BUDGET_CENTS: ${CERNIS_MAX_BUDGET_CENTS:-}
+      # Phase 14d persisted spend across container restarts. Empty by
+      # default — operators opt in by setting CERNIS_PERSISTED_SPEND_FILE
+      # in .env. When set to /var/lib/cernis/spend/llm_spend_running.json,
+      # the dedicated writable volume below holds the file across runs.
+      CERNIS_PERSISTED_SPEND_FILE: ${CERNIS_PERSISTED_SPEND_FILE:-}
     volumes:
       # Read-only bind for cells_file + per-target tasks overlay. The
       # sweep orchestrator writes ./data/llm_cells.json which the bot
       # consumes at /data/llm_cells.json inside the container.
       - ./data:/data:ro
+      # Phase 14d: dedicated writable mount for the persisted spend
+      # file. Separate from /data so the bot can't be coerced into
+      # writing somewhere the cells_file would be visible.
+      - ./data/llm_spend:/var/lib/cernis/spend:rw
     depends_on:
       - capture
     networks: [cernis_lab]

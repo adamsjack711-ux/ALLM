@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import datetime as dt
 import json
 import os
 import pathlib
@@ -179,6 +180,89 @@ def _add_spend(cents: Optional[float]) -> None:
         _spend_state["cents"] += float(cents)
     if MAX_BUDGET_CENTS is not None and _spend_state["cents"] >= MAX_BUDGET_CENTS:
         _spend_state["exhausted"] = True
+
+
+# ── phase 14d: persisted spend across container restarts ──────────
+
+
+def _persisted_spend_file() -> Optional[pathlib.Path]:
+    """Phase 14d: opt-in via CERNIS_PERSISTED_SPEND_FILE. When set,
+    the bot loads the saved spend at startup so CERNIS_MAX_BUDGET_CENTS
+    persists across container restarts; saves after each cell. Unset
+    → no persistence (legacy single-run behavior)."""
+    raw = os.environ.get("CERNIS_PERSISTED_SPEND_FILE", "").strip()
+    return pathlib.Path(raw) if raw else None
+
+
+PERSISTED_SPEND_FILE = _persisted_spend_file()
+
+
+def _load_persisted_spend() -> None:
+    """Read the persisted spend file (if set + exists + parses). Sets
+    `_spend_state["cents"]` to the saved value and logs a one-line
+    notice. Schema drift (different MAX_BUDGET or PRICING_TABLE_VERSION
+    than the saved run) surfaces a warning but doesn't reset — the
+    operator decides whether to clear the file."""
+    if PERSISTED_SPEND_FILE is None or not PERSISTED_SPEND_FILE.exists():
+        return
+    try:
+        payload = json.loads(PERSISTED_SPEND_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"[real_agent] persisted spend file unreadable "
+            f"({type(exc).__name__}); starting fresh",
+            file=sys.stderr,
+        )
+        return
+    saved_cents = payload.get("cents")
+    if not isinstance(saved_cents, (int, float)):
+        return
+    _spend_state["cents"] = float(saved_cents)
+    saved_budget = payload.get("max_budget_cents")
+    if (saved_budget is not None and MAX_BUDGET_CENTS is not None
+            and float(saved_budget) != MAX_BUDGET_CENTS):
+        print(
+            f"[real_agent] persisted budget changed: file says "
+            f"{saved_budget} cents, env says {MAX_BUDGET_CENTS} cents. "
+            f"Continuing with the env value; carry-over spend still "
+            f"counts against it.",
+            file=sys.stderr,
+        )
+    saved_version = payload.get("pricing_table_version")
+    if (saved_version and saved_version != pricingmod.PRICING_TABLE_VERSION):
+        print(
+            f"[real_agent] persisted spend was computed at pricing table "
+            f"v{saved_version}; current is v{pricingmod.PRICING_TABLE_VERSION}. "
+            f"Carry-over total is at OLD rates.",
+            file=sys.stderr,
+        )
+    if MAX_BUDGET_CENTS is not None and _spend_state["cents"] >= MAX_BUDGET_CENTS:
+        _spend_state["exhausted"] = True
+    print(
+        f"[real_agent] loaded persisted spend: "
+        f"{pricingmod.format_cents(_spend_state['cents'])} "
+        f"from {PERSISTED_SPEND_FILE}",
+        flush=True,
+    )
+
+
+def _save_persisted_spend() -> None:
+    """Write the current running total + metadata. Atomic-ish: write
+    to a sibling .tmp then rename, so a crash mid-write doesn't truncate
+    the persisted file."""
+    if PERSISTED_SPEND_FILE is None:
+        return
+    PERSISTED_SPEND_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "cents": _spend_state["cents"],
+        "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+        "max_budget_cents": MAX_BUDGET_CENTS,
+        "pricing_table_version": pricingmod.PRICING_TABLE_VERSION,
+        "skipped_cells_so_far": _spend_state["skipped_cells"],
+    }
+    tmp = PERSISTED_SPEND_FILE.with_suffix(PERSISTED_SPEND_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.replace(PERSISTED_SPEND_FILE)
 
 
 def _dry_run_tokens() -> tuple[int, int]:
@@ -469,17 +553,29 @@ def _payload_for(cell: AgentCell, *, tokens_in: int = 0, tokens_out: int = 0) ->
     )
 
 
+class BudgetExceeded(Exception):
+    """Phase 14d: raised mid-LLM-call from `_TokenCounter.on_llm_start`
+    when the cumulative spend (global + this session's realized cost so
+    far) would exceed `CERNIS_MAX_BUDGET_CENTS`. Propagates through
+    `agent.run()` so the session aborts before another LLM call is
+    made — the between-session kill-switch from phase 14c can't stop
+    a single runaway browser-use loop, this one can."""
+
+
 class _TokenCounter:
     """Async langchain BaseCallbackHandler that sums prompt_tokens +
-    completion_tokens across every LLM call inside one session.
+    completion_tokens across every LLM call inside one session, AND
+    enforces the mid-call hard kill (phase 14d) via on_llm_start.
 
     Defined inline (rather than imported from a top-level class) so the
     bot module can load without langchain installed — the smoke + the
     dry-run path don't touch this code at all."""
 
-    def __init__(self) -> None:
+    def __init__(self, backend: str = "", model: str = "") -> None:
         self.tokens_in = 0
         self.tokens_out = 0
+        self._backend = backend
+        self._model = model
 
     def _accumulate(self, response) -> None:
         llm_output = getattr(response, "llm_output", None) or {}
@@ -492,6 +588,35 @@ class _TokenCounter:
         self.tokens_out += int(
             usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
         )
+
+    def realized_cost_cents(self) -> Optional[float]:
+        """Cost from accumulated tokens so far. Used both by the
+        on_llm_start budget check and the partial-session record at
+        abort time."""
+        if not self._backend or not self._model:
+            return None
+        return pricingmod.estimate_cost_cents(
+            self._backend, self._model, self.tokens_in, self.tokens_out,
+        )
+
+    async def on_llm_start(self, *args, **kwargs) -> None:  # noqa: D401
+        # Phase 14d: hard kill. Check whether the spend so far
+        # (global + this session's realized cost) already exceeds the
+        # budget. If yes, abort BEFORE another LLM call begins.
+        # `_check_budget` is called per-session in `_run_cell` BEFORE
+        # we get here, so this is the second line of defense for
+        # runaway sessions whose realized cost overshoots the
+        # per-session projection.
+        if MAX_BUDGET_CENTS is None:
+            return
+        realized = self.realized_cost_cents() or 0.0
+        if (_spend_state["cents"] + realized) > MAX_BUDGET_CENTS:
+            raise BudgetExceeded(
+                f"budget {pricingmod.format_cents(MAX_BUDGET_CENTS)} would be "
+                f"exceeded by the next LLM call: prior spend "
+                f"{pricingmod.format_cents(_spend_state['cents'])} + "
+                f"this session so far {pricingmod.format_cents(realized)}"
+            )
 
     async def on_llm_end(self, response, **kwargs) -> None:  # noqa: D401
         self._accumulate(response)
@@ -518,7 +643,7 @@ async def _run_one_session(cell: AgentCell) -> Optional[float]:
 
     from browser_use import Agent, BrowserSession  # noqa: PLC0415
     api_key = _api_key_for(cell.backend)
-    counter = _TokenCounter()
+    counter = _TokenCounter(backend=cell.backend, model=cell.model)
     if cell.backend == "openai":
         from langchain_openai import ChatOpenAI  # noqa: PLC0415
         llm = ChatOpenAI(model=cell.model, api_key=api_key, callbacks=[counter])
@@ -530,6 +655,7 @@ async def _run_one_session(cell: AgentCell) -> Optional[float]:
     session = BrowserSession(extra_http_headers=extra_headers, headless=True)
     agent = Agent(task=cell.task, llm=llm, browser_session=session)
     realized_cost: Optional[float] = None
+    aborted_mid_call = False
     try:
         await agent.run()
         # Build the provenance payload AFTER the agent finishes so we
@@ -550,11 +676,27 @@ async def _run_one_session(cell: AgentCell) -> Optional[float]:
                 f"[real_agent] provenance post skipped: {type(exc).__name__}",
                 flush=True,
             )
+    except BudgetExceeded as exc:
+        # Phase 14d: mid-call hard kill. The partial token count + cost
+        # are still attributed to spend so the operator's running total
+        # is accurate; the session just doesn't get a provenance row
+        # (no cernis_sid was minted for a half-run agent).
+        aborted_mid_call = True
+        realized_cost = counter.realized_cost_cents()
+        print(
+            f"[real_agent]   ABORTED mid-call: {exc} "
+            f"(partial spend {pricingmod.format_cents(realized_cost)})",
+            flush=True,
+        )
     finally:
         try:
             await session.close()
         except Exception:
             pass
+    if aborted_mid_call:
+        # Mark the run as exhausted so subsequent sessions/cells skip
+        # without going through the on_llm_start path again.
+        _spend_state["exhausted"] = True
     return realized_cost
 
 
@@ -652,14 +794,23 @@ async def _run_cell(cell: AgentCell) -> None:
 
 
 async def main() -> None:
+    # Phase 14d: drift warning + persisted-spend load before anything
+    # else, so the budget banner reflects carry-over.
+    pricingmod.warn_if_stale()
+    _load_persisted_spend()
+
     cells = build_cells()
     budget_label = (
         f" max_budget={pricingmod.format_cents(MAX_BUDGET_CENTS)}"
         if MAX_BUDGET_CENTS is not None else ""
     )
+    persisted_label = (
+        f" persisted_file={PERSISTED_SPEND_FILE}"
+        if PERSISTED_SPEND_FILE is not None else ""
+    )
     print(
         f"[real_agent] phase 14 matrix runner v{GENERATOR_VERSION} "
-        f"n_cells={len(cells)} dry_run={DRY_RUN}{budget_label}",
+        f"n_cells={len(cells)} dry_run={DRY_RUN}{budget_label}{persisted_label}",
         flush=True,
     )
     if DRY_RUN and DRY_RUN_LOG.exists():
@@ -676,7 +827,14 @@ async def main() -> None:
             _spend_state["skipped_cells"] += 1
             continue
         await _run_cell(cell)
+        # Phase 14d: persist after every cell so a crash mid-run
+        # doesn't lose accumulated spend.
+        _save_persisted_spend()
         n_run += 1
+
+    # Final save covers the case where the very last cell was skipped
+    # (the in-loop save wouldn't fire) — important for the smoke.
+    _save_persisted_spend()
 
     if MAX_BUDGET_CENTS is not None:
         print(

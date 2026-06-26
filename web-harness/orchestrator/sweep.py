@@ -168,11 +168,18 @@ _DEFAULT_LLM_MODELS = {
 }
 
 # Browser-driven LLM cells against HTML targets present in `_TARGETS`.
-# VAmPI is JSON-only — excluded because a browser-use agent there adds
-# no detection signal beyond what sqlmap / raw_httpx already produce.
-# Phase 14c adds WebGoat to this list now that it's registered in
-# `_TARGETS`; the default matrix grew 12→16 cells.
+# VAmPI is JSON-only — excluded from the browser-driven matrix because
+# a browser-use agent there adds no detection signal beyond what sqlmap
+# / raw_httpx already produce. Phase 14c added WebGoat (matrix 12→16);
+# phase 14-vampi added the parallel HTTP-only matrix below for VAmPI.
 _LLM_TARGETS = ("dvwa", "juice_shop", "webgoat", "crapi")
+
+# Phase 14-vampi: HTTP-only LLM cells via `real_agent_http`. VAmPI's
+# JSON-only API has no DOM; the langchain-httpx tool loop in
+# `generators/real_agent_http/bot.py` gives the capture proxy real
+# `class=agent` traffic with the new `extra.framework="langchain-httpx"`
+# distinguishing it from the browser flavor at consumer time.
+_LLM_HTTP_TARGETS = ("vampi",)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -234,6 +241,84 @@ def default_llm_config(
                         stealth=stealth, sessions=sessions_per_cell,
                     ))
     return cells
+
+
+# ── phase 14-vampi: HTTP-only LLM cells ─────────────────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class LlmHttpSweepCell:
+    """HTTP-flavor cell. No stealth axis (no browser fingerprint to
+    mask), no security_level (VAmPI has none). Otherwise mirrors
+    LlmSweepCell so cost_projection_for_cells works on it too via
+    duck-typed access to backend / model / sessions."""
+    target_app: str
+    target_url: str
+    backend: str
+    model: str
+    sessions: int
+
+    def family(self) -> str:
+        import re as _re
+        slug = lambda s: _re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+        return f"llm_{slug(self.backend)}_{slug(self.model)}"
+
+    @property
+    def stealth(self) -> bool:
+        return False  # HTTP has no stealth axis
+
+    def to_cellsfile_entry(self) -> dict:
+        """Shape the http bot's `_build_cells_from_file` expects.
+        Note: no `stealth` key — that's only in the browser cell shape."""
+        return {
+            "target_url": self.target_url,
+            "target_app": self.target_app,
+            "backend": self.backend,
+            "model": self.model,
+            "sessions": self.sessions,
+        }
+
+
+def default_llm_http_config(
+    *,
+    backends: Iterable[str] = _DEFAULT_LLM_BACKENDS,
+    models: dict[str, Iterable[str]] | None = None,
+    target_apps: Iterable[str] = _LLM_HTTP_TARGETS,
+    sessions_per_cell: int = 2,
+) -> list[LlmHttpSweepCell]:
+    """Phase 14-vampi: HTTP-only LLM cell matrix. Default 1 target × 2
+    backends × 1 model = 2 cells. The HTTP path doesn't have a stealth
+    axis (there's no browser fingerprint to mask) so the matrix stays
+    small even at full coverage."""
+    models = dict(models or _DEFAULT_LLM_MODELS)
+    cells: list[LlmHttpSweepCell] = []
+    for target_app in target_apps:
+        if target_app not in _TARGETS:
+            raise ValueError(
+                f"unknown target_app {target_app!r}; expected one of "
+                f"{sorted(_TARGETS)}"
+            )
+        url = _TARGETS[target_app]["url"]
+        for backend in backends:
+            for model in models.get(backend, ()):
+                cells.append(LlmHttpSweepCell(
+                    target_app=target_app, target_url=url,
+                    backend=backend, model=model,
+                    sessions=sessions_per_cell,
+                ))
+    return cells
+
+
+def write_llm_http_cells_file(
+    cells: Iterable["LlmHttpSweepCell"], path: pathlib.Path,
+) -> None:
+    """Emit the JSON shape that `real_agent_http/bot.py` consumes via
+    CERNIS_AGENT_CELLS_FILE."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {"cells": [c.to_cellsfile_entry() for c in cells]},
+        indent=2,
+    ))
 
 
 def cost_projection_for_cells(cells: Iterable[LlmSweepCell]) -> dict:

@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY proxy.py honeypots.py beacon.js /app/
+COPY proxy.py honeypots.py redaction.py beacon.js consent.html /app/
 
 ENV PYTHONUNBUFFERED=1 \
     UPSTREAM=http://dvwa:80 \

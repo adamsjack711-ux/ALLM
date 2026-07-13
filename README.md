@@ -1,4 +1,4 @@
-# — AI-Attack Detector
+# Cernis — AI-Attack Detector
 
 CERNIS is a tool that helps spot computer attacks run by an AI. It reads
 security logs and tries to tell when an AI agent — not a person — is doing
@@ -74,6 +74,8 @@ different job and is not part of this project.
   starts. Lower is better.
 
 ## Results
+
+![PR-AUC on held-out campaigns: the hybrid model beats both single models on every seed](./results.png)
 
 These numbers come from **fake (synthetic) test data**, split by campaign.
 Real-world results may be different. Full numbers and methods are in
